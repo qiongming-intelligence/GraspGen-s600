@@ -136,13 +136,13 @@ def sample_and_group(
         radius: ball query radius
         nsample: max sample number in local region
         xyz: (B, N, 3) input points
-        points: (B, N, C) input features
+        points: (B, C, N) input features (channel first)
 
     Returns:
         new_xyz: (B, npoint, 3) sampled centroids
         new_points: (B, npoint, nsample, C+3) grouped features
     """
-    B, N, C = xyz.shape
+    B, N, _ = xyz.shape
 
     # Sample centroids
     fps_idx = farthest_point_sample_pytorch(xyz, npoint)  # (B, npoint)
@@ -155,22 +155,19 @@ def sample_and_group(
     # Query ball point
     idx = query_ball_point(radius, nsample, xyz, new_xyz)  # (B, npoint, nsample)
 
-    # Group points
-    grouped_xyz = torch.gather(
-        xyz.unsqueeze(1).expand(-1, npoint, -1, -1),
-        2,
-        idx.unsqueeze(-1).expand(-1, -1, -1, 3)
-    )  # (B, npoint, nsample, 3)
+    # Group xyz coordinates
+    # Use advanced indexing instead of gather
+    batch_indices = torch.arange(B, device=xyz.device).view(B, 1, 1)
+    grouped_xyz = xyz[batch_indices, idx]  # (B, npoint, nsample, 3)
 
     # Translate to relative coordinates
     grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
 
     if points is not None:
-        grouped_points = torch.gather(
-            points.unsqueeze(1).expand(-1, npoint, -1, -1),
-            2,
-            idx.unsqueeze(-1).expand(-1, -1, -1, points.shape[-1])
-        )  # (B, npoint, nsample, C)
+        # points: (B, C, N) -> need to gather along N dimension
+        # Reshape for gathering: (B, N, C)
+        points_transposed = points.transpose(1, 2)  # (B, N, C)
+        grouped_points = points_transposed[batch_indices, idx]  # (B, npoint, nsample, C)
         new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
     else:
         new_points = grouped_xyz_norm
