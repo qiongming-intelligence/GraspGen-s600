@@ -269,23 +269,38 @@ class PointNetUpstream(nn.Module):
         super().__init__()
         self.output_embedding_dim = output_embedding_dim
 
-        # Build MLP configs
+        # Build MLP configs (upstream logic from PointNetPlusPlus.__init__)
         mlp = []
         for elem in self.OBJ_MLPS:
             mlp.append(elem.copy())
+
+        # The first SA layer's in_channel depends on feature_dim:
+        # - If feature_dim > 0: use features beyond xyz, in_channel = feature_dim
+        # - If feature_dim == -1 (xyz-only): in_channel = 0, but use_xyz=True adds 3
+        # The mlp[0][0] = 0 is a placeholder; the actual in_channel to the MLP conv
+        # is determined by sample_and_group's output (xyz + features if use_xyz=True).
+        # Since use_xyz=True, the first SA gets 3 (xyz) + feature_dim if >0, else just 3.
         if feature_dim > 0:
             mlp[0][0] = feature_dim
 
         # Set Abstraction layers
         self.obj_SA_modules = nn.ModuleList()
         for k in range(len(self.OBJ_NPOINTS)):
+            # Compute actual in_channel for this SA layer
+            if k == 0:
+                # First SA: use_xyz=True adds 3, mlp[0][0] is feature_dim or 0
+                actual_in = 3 + (mlp[k][0] if mlp[k][0] > 0 else 0)
+            else:
+                # Subsequent SAs: use_xyz=True adds 3, input features from prev SA
+                actual_in = 3 + mlp[k-1][-1]
+
             self.obj_SA_modules.append(
                 PointNetSetAbstraction(
                     npoint=self.OBJ_NPOINTS[k],
                     radius=self.OBJ_RADII[k],
                     nsample=self.OBJ_NSAMPLES[k],
-                    in_channel=mlp[k][0],
-                    mlp=mlp[k],
+                    in_channel=actual_in,
+                    mlp=mlp[k][1:],  # skip the placeholder first elem
                     group_all=(self.OBJ_NPOINTS[k] is None),
                     use_xyz=True,
                 )
