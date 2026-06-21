@@ -222,26 +222,34 @@ class PointNetSetAbstraction(nn.Module):
 
         Args:
             xyz: (B, N, 3) input points
-            points: (B, N, C) input features
+            points: (B, C, N) input features (channel first)
 
         Returns:
             new_xyz: (B, npoint, 3) sampled points
             new_points: (B, mlp[-1], npoint) output features
         """
         if self.group_all:
-            new_xyz = xyz.mean(dim=1, keepdim=True)
+            # Global pooling: use all points
+            new_xyz = xyz.mean(dim=1, keepdim=True)  # (B, 1, 3)
+
             if points is not None:
-                new_points = torch.cat([xyz, points], dim=-1).unsqueeze(2)
+                # points: (B, C, N) -> (B, N, C)
+                points_transposed = points.transpose(1, 2)
+                # Concatenate xyz and features
+                new_points = torch.cat([xyz, points_transposed], dim=-1)  # (B, N, 3+C)
+                new_points = new_points.unsqueeze(2)  # (B, N, 1, 3+C)
             else:
-                new_points = xyz.unsqueeze(2)
+                new_points = xyz.unsqueeze(2)  # (B, N, 1, 3)
+
+            # Permute for conv: (B, 3+C, 1, N)
+            new_points = new_points.permute(0, 3, 2, 1)
         else:
             new_xyz, new_points = sample_and_group(
                 self.npoint, self.radius, self.nsample, xyz, points
             )
-
-        # new_points: (B, npoint, nsample, C+3)
-        # Permute for conv: (B, C+3, nsample, npoint)
-        new_points = new_points.permute(0, 3, 2, 1)
+            # new_points: (B, npoint, nsample, C+3)
+            # Permute for conv: (B, C+3, nsample, npoint)
+            new_points = new_points.permute(0, 3, 2, 1)
 
         # Apply MLP
         for i, conv in enumerate(self.mlp_convs):
