@@ -71,6 +71,11 @@ def main() -> int:
     upstream_encoder = PointNetPlusPlus(output_embedding_dim=512, feature_dim=-1)
     upstream_encoder.eval()
 
+    # Check if CUDA is available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Using device: {device}")
+    upstream_encoder = upstream_encoder.to(device)
+
     # Load into upstream (should work directly)
     try:
         upstream_encoder.load_state_dict(encoder_state, strict=True)
@@ -83,6 +88,7 @@ def main() -> int:
     print("\n[4/5] Creating our PointNetUpstream...")
     our_encoder = PointNetUpstream(output_embedding_dim=512, feature_dim=-1)
     our_encoder.eval()
+    our_encoder = our_encoder.to(device)
 
     print("  Our keys:", list(our_encoder.state_dict().keys())[:8])
     print("  Checkpoint keys:", list(encoder_state.keys())[:8])
@@ -106,7 +112,7 @@ def main() -> int:
 
     # Compare outputs
     print("\n[5/5] Comparing outputs on same input...")
-    test_pc = torch.randn(1, 2048, 3)
+    test_pc = torch.randn(1, 2048, 3).to(device)
 
     with torch.no_grad():
         upstream_out = upstream_encoder(test_pc)

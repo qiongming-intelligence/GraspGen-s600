@@ -196,7 +196,7 @@ class PointNetSetAbstraction(nn.Module):
         layers = []
         last_channel = in_channel
         for out_channel in mlp:
-            layers.append(nn.Conv2d(last_channel, out_channel, 1))
+            layers.append(nn.Conv2d(last_channel, out_channel, 1, bias=False))
             layers.append(nn.BatchNorm2d(out_channel))
             layers.append(nn.ReLU(True))
             last_channel = out_channel
