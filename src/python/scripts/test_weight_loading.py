@@ -37,19 +37,32 @@ def main() -> int:
     ckpt_path = PROJECT_ROOT / "models/upstream/graspgen_robotiq_2f_140_gen.pth"
     print(f"\n[1/5] Loading upstream checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu")
-    print(f"  Keys in checkpoint: {list(ckpt.keys())[:5]}...")
+    print(f"  Top-level keys: {list(ckpt.keys())}")
+
+    # The state dict is nested under 'model'
+    if 'model' in ckpt:
+        state_dict = ckpt['model']
+        print(f"  Found 'model' key, has {len(state_dict)} keys")
+    else:
+        state_dict = ckpt
+        print(f"  Using checkpoint directly as state dict")
 
     # Extract object_encoder weights
-    encoder_keys = [k for k in ckpt.keys() if k.startswith("grasp_generator.object_encoder.")]
+    encoder_keys = [k for k in state_dict.keys() if k.startswith("grasp_generator.object_encoder.")]
     print(f"  Found {len(encoder_keys)} object_encoder keys")
-    print(f"  Example keys: {encoder_keys[:3]}")
+    if encoder_keys:
+        print(f"  Example keys: {encoder_keys[:3]}")
+    else:
+        # Debug: show what prefixes exist
+        prefixes = set(k.split('.')[0] for k in state_dict.keys())
+        print(f"  Available top-level prefixes: {sorted(prefixes)[:10]}")
 
     # Strip prefix
     encoder_state = {}
     prefix = "grasp_generator.object_encoder."
     for k in encoder_keys:
         new_k = k[len(prefix):]
-        encoder_state[new_k] = ckpt[k]
+        encoder_state[new_k] = state_dict[k]
 
     print(f"\n[2/5] Stripped prefix, state dict keys: {list(encoder_state.keys())[:5]}...")
 
