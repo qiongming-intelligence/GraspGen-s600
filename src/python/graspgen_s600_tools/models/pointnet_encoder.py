@@ -46,11 +46,39 @@ def square_distance(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     return dist
 
 
+def random_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    Random sampling (ONNX-compatible replacement for FPS).
+
+    This is a simplified sampling strategy that is fully ONNX-exportable.
+    While not as geometrically optimal as FPS, it's sufficient for many
+    applications and significantly faster.
+
+    Args:
+        xyz: (B, N, 3) input points
+        npoint: number of points to sample
+
+    Returns:
+        indices: (B, npoint) indices of sampled points
+    """
+    B, N, C = xyz.shape
+    device = xyz.device
+
+    # Generate random indices
+    # Use a fixed seed for reproducibility if needed
+    indices = torch.randint(0, N, (B, npoint), device=device, dtype=torch.long)
+
+    return indices
+
+
 def farthest_point_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     """
     Pure PyTorch farthest point sampling (no CUDA extension).
 
-    This is slower than CUDA version but fully ONNX-exportable.
+    NOTE: This function has ONNX compatibility issues due to dynamic indexing.
+    Use random_sample_pytorch() for ONNX export.
+
+    This is slower than CUDA version but fully differentiable.
 
     Args:
         xyz: (B, N, 3) input points
@@ -75,7 +103,7 @@ def farthest_point_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tenso
         centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
         dist = torch.sum((xyz - centroid) ** 2, dim=-1)
         mask = dist < distance
-        distance[mask] = dist[mask]
+        distance = torch.where(mask, dist, distance)
         farthest = torch.max(distance, dim=-1)[1]
 
     return centroids
@@ -128,7 +156,8 @@ def sample_and_group(
     radius: float,
     nsample: int,
     xyz: torch.Tensor,
-    points: Optional[torch.Tensor] = None
+    points: Optional[torch.Tensor] = None,
+    use_random_sample: bool = True
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Sample and group points (ONNX-compatible version).
@@ -139,6 +168,7 @@ def sample_and_group(
         nsample: max sample number in local region
         xyz: (B, N, 3) input points
         points: (B, C, N) input features (channel first)
+        use_random_sample: use random sampling (ONNX-compatible) instead of FPS
 
     Returns:
         new_xyz: (B, npoint, 3) sampled centroids
@@ -147,7 +177,12 @@ def sample_and_group(
     B, N, _ = xyz.shape
 
     # Sample centroids
-    fps_idx = farthest_point_sample_pytorch(xyz, npoint)  # (B, npoint)
+    if use_random_sample:
+        # ONNX-compatible random sampling
+        fps_idx = random_sample_pytorch(xyz, npoint)
+    else:
+        # FPS (not ONNX-compatible)
+        fps_idx = farthest_point_sample_pytorch(xyz, npoint)
 
     # Gather sampled points using gather (ONNX-compatible)
     new_xyz = torch.gather(
