@@ -112,10 +112,14 @@ def main() -> int:
 
     # Compare outputs
     print("\n[5/5] Comparing outputs on same input...")
+    torch.manual_seed(42)
     test_pc = torch.randn(1, 2048, 3).to(device)
 
     with torch.no_grad():
+        torch.manual_seed(42)  # Reset for upstream sampling
         upstream_out = upstream_encoder(test_pc)
+
+        torch.manual_seed(42)  # Same seed for our random sampling
         our_out = our_encoder(test_pc)
 
     print(f"  Upstream output: {upstream_out.shape}  mean={upstream_out.mean():.6f}")
@@ -129,8 +133,9 @@ def main() -> int:
         print("\n✅ Weight loading SUCCESS! Outputs match within 1e-4.")
         return 0
     elif strict_ok:
-        print(f"\n⚠ Weights loaded but outputs differ (max={diff.max().item():.3e}).")
-        print("  Possible cause: architectural mismatch or random sampling seed.")
+        print(f"\n⚠ Weights loaded (strict=True) but outputs differ (max={diff.max().item():.3e}).")
+        print("  Expected: upstream uses FPS (geometrically optimal), ours uses random sampling (ONNX-compatible).")
+        print("  This difference will impact final grasp generation accuracy.")
         return 0
     else:
         print("\n❌ Weight loading INCOMPLETE. Key mismatch needs resolution.")
