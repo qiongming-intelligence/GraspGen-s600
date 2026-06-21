@@ -129,7 +129,7 @@ def sample_and_group(
     points: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sample and group points.
+    Sample and group points (ONNX-compatible version).
 
     Args:
         npoint: number of centroids
@@ -147,7 +147,7 @@ def sample_and_group(
     # Sample centroids
     fps_idx = farthest_point_sample_pytorch(xyz, npoint)  # (B, npoint)
 
-    # Gather sampled points
+    # Gather sampled points using gather (ONNX-compatible)
     new_xyz = torch.gather(
         xyz, 1, fps_idx.unsqueeze(-1).expand(-1, -1, 3)
     )  # (B, npoint, 3)
@@ -155,19 +155,28 @@ def sample_and_group(
     # Query ball point
     idx = query_ball_point(radius, nsample, xyz, new_xyz)  # (B, npoint, nsample)
 
-    # Group xyz coordinates
-    # Use advanced indexing instead of gather
-    batch_indices = torch.arange(B, device=xyz.device).view(B, 1, 1)
-    grouped_xyz = xyz[batch_indices, idx]  # (B, npoint, nsample, 3)
+    # Group xyz coordinates using gather
+    # Expand idx for xyz gathering: (B, npoint, nsample, 3)
+    idx_expanded = idx.unsqueeze(-1).expand(-1, -1, -1, 3)
+    # Expand xyz for gathering: (B, npoint, N, 3) -> gather along dim 2
+    xyz_expanded = xyz.unsqueeze(1).expand(-1, npoint, -1, -1)
+    grouped_xyz = torch.gather(xyz_expanded, 2, idx_expanded)  # (B, npoint, nsample, 3)
 
     # Translate to relative coordinates
     grouped_xyz_norm = grouped_xyz - new_xyz.unsqueeze(2)
 
     if points is not None:
-        # points: (B, C, N) -> need to gather along N dimension
-        # Reshape for gathering: (B, N, C)
-        points_transposed = points.transpose(1, 2)  # (B, N, C)
-        grouped_points = points_transposed[batch_indices, idx]  # (B, npoint, nsample, C)
+        # points: (B, C, N) -> gather along N dimension
+        C = points.shape[1]
+        # Expand idx for points gathering: (B, npoint, nsample, C)
+        idx_expanded_points = idx.unsqueeze(1).expand(-1, C, -1, -1)  # (B, C, npoint, nsample)
+        # Expand points for gathering: (B, C, npoint, N)
+        points_expanded = points.unsqueeze(2).expand(-1, -1, npoint, -1)
+        # Gather: (B, C, npoint, nsample)
+        grouped_points = torch.gather(points_expanded, 3, idx_expanded_points)
+        # Transpose to (B, npoint, nsample, C)
+        grouped_points = grouped_points.permute(0, 2, 3, 1)
+
         new_points = torch.cat([grouped_xyz_norm, grouped_points], dim=-1)
     else:
         new_points = grouped_xyz_norm
