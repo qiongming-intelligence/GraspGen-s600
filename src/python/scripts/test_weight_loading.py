@@ -48,7 +48,7 @@ def main() -> int:
         print(f"  Using checkpoint directly as state dict")
 
     # Extract object_encoder weights
-    encoder_keys = [k for k in state_dict.keys() if k.startswith("grasp_generator.object_encoder.")]
+    encoder_keys = [k for k in state_dict.keys() if k.startswith("object_encoder.")]
     print(f"  Found {len(encoder_keys)} object_encoder keys")
     if encoder_keys:
         print(f"  Example keys: {encoder_keys[:3]}")
@@ -59,7 +59,7 @@ def main() -> int:
 
     # Strip prefix
     encoder_state = {}
-    prefix = "grasp_generator.object_encoder."
+    prefix = "object_encoder."
     for k in encoder_keys:
         new_k = k[len(prefix):]
         encoder_state[new_k] = state_dict[k]
