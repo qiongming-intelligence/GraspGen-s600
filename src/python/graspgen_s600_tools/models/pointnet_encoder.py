@@ -225,23 +225,25 @@ class PointNetSetAbstraction(nn.Module):
             points: (B, C, N) input features (channel first)
 
         Returns:
-            new_xyz: (B, npoint, 3) sampled points
-            new_points: (B, mlp[-1], npoint) output features
+            new_xyz: (B, npoint, 3) or (B, 1, 3) sampled points
+            new_points: (B, mlp[-1], npoint) or (B, mlp[-1], 1) output features
         """
         if self.group_all:
             # Global pooling: use all points
             new_xyz = xyz.mean(dim=1, keepdim=True)  # (B, 1, 3)
+            B, N, _ = xyz.shape
 
             if points is not None:
                 # points: (B, C, N) -> (B, N, C)
                 points_transposed = points.transpose(1, 2)
                 # Concatenate xyz and features
-                new_points = torch.cat([xyz, points_transposed], dim=-1)  # (B, N, 3+C)
-                new_points = new_points.unsqueeze(2)  # (B, N, 1, 3+C)
+                combined = torch.cat([xyz, points_transposed], dim=-1)  # (B, N, 3+C)
             else:
-                new_points = xyz.unsqueeze(2)  # (B, N, 1, 3)
+                combined = xyz  # (B, N, 3)
 
-            # Permute for conv: (B, 3+C, 1, N)
+            # Treat all points as one group: (B, 1, N, C+3)
+            new_points = combined.unsqueeze(1)  # (B, 1, N, 3+C)
+            # Permute for conv: (B, 3+C, N, 1)
             new_points = new_points.permute(0, 3, 2, 1)
         else:
             new_xyz, new_points = sample_and_group(
@@ -256,8 +258,9 @@ class PointNetSetAbstraction(nn.Module):
             bn = self.mlp_bns[i]
             new_points = F.relu(bn(conv(new_points)))
 
-        # Max pooling over nsample
-        new_points = torch.max(new_points, dim=2)[0]  # (B, mlp[-1], npoint)
+        # Max pooling over nsample (or N for group_all)
+        # new_points: (B, mlp[-1], nsample/N, npoint/1)
+        new_points = torch.max(new_points, dim=2)[0]  # (B, mlp[-1], npoint/1)
 
         return new_xyz, new_points
 
