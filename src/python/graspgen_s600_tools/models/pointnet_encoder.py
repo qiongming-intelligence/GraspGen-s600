@@ -46,13 +46,13 @@ def square_distance(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
     return dist
 
 
-def random_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+def uniform_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     """
-    Random sampling (ONNX-compatible replacement for FPS).
+    Deterministic uniform sampling (ONNX-compatible replacement for FPS).
 
-    This is a simplified sampling strategy that is fully ONNX-exportable.
-    While not as geometrically optimal as FPS, it's sufficient for many
-    applications and significantly faster.
+    This uses uniform stride sampling for deterministic, reproducible results.
+    While not as geometrically optimal as FPS, it's fully ONNX-exportable
+    and gives consistent results between PyTorch and ONNX.
 
     Args:
         xyz: (B, N, 3) input points
@@ -64,9 +64,18 @@ def random_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     B, N, C = xyz.shape
     device = xyz.device
 
-    # Generate random indices
-    # Use a fixed seed for reproducibility if needed
-    indices = torch.randint(0, N, (B, npoint), device=device, dtype=torch.long)
+    # Uniform sampling with deterministic stride
+    # Sample every (N // npoint)-th point
+    stride = N // npoint
+    if stride == 0:
+        stride = 1
+
+    # Create indices [0, stride, 2*stride, ..., (npoint-1)*stride]
+    indices = torch.arange(0, npoint, dtype=torch.long, device=device) * stride
+    indices = indices.clamp(max=N-1)  # Ensure within bounds
+
+    # Expand for batch dimension
+    indices = indices.unsqueeze(0).expand(B, -1)  # (B, npoint)
 
     return indices
 
@@ -168,7 +177,7 @@ def sample_and_group(
         nsample: max sample number in local region
         xyz: (B, N, 3) input points
         points: (B, C, N) input features (channel first)
-        use_random_sample: use random sampling (ONNX-compatible) instead of FPS
+        use_random_sample: use uniform sampling (ONNX-compatible) instead of FPS
 
     Returns:
         new_xyz: (B, npoint, 3) sampled centroids
@@ -178,8 +187,8 @@ def sample_and_group(
 
     # Sample centroids
     if use_random_sample:
-        # ONNX-compatible random sampling
-        fps_idx = random_sample_pytorch(xyz, npoint)
+        # ONNX-compatible uniform sampling (deterministic)
+        fps_idx = uniform_sample_pytorch(xyz, npoint)
     else:
         # FPS (not ONNX-compatible)
         fps_idx = farthest_point_sample_pytorch(xyz, npoint)
