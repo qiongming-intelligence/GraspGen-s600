@@ -1,0 +1,61 @@
+{
+  "name": "graspgen_discriminator",
+  "description": "GraspGen Discriminator with pointnet backbone",
+  "onnx_path": "models/onnx/graspgen_discriminator_pointnet.onnx",
+  "hbm_name": "graspgen_discriminator_pointnet.hbm",
+  "inputs": [
+    {
+      "name": "pc",
+      "description": "Input point cloud (normalized)",
+      "concrete_shape": [
+        1,
+        2048,
+        3
+      ],
+      "dtype": "float32",
+      "range": [
+        -1.0,
+        1.0
+      ]
+    },
+    {
+      "name": "grasps",
+      "description": "Grasp candidates to score",
+      "concrete_shape": [
+        1,
+        20,
+        9
+      ],
+      "dtype": "float32"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "scores",
+      "description": "Quality scores for each grasp",
+      "concrete_shape": [
+        1,
+        20
+      ],
+      "dtype": "float32",
+      "range": [
+        0.0,
+        1.0
+      ]
+    }
+  ],
+  "config": {
+    "obs_backbone": "pointnet",
+    "grasp_repr": "r3_6d",
+    "batch_size": 1
+  },
+  "metadata": {
+    "target_platform": "horizon_s600",
+    "optimization_hints": {
+      "core_num": 1,
+      "optimize_level": "O2",
+      "quantization": "int16",
+      "calibration_type": "max"
+    }
+  }
+}
