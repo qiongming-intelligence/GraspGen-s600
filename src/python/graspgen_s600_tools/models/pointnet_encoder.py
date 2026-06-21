@@ -88,7 +88,7 @@ def query_ball_point(
     new_xyz: torch.Tensor
 ) -> torch.Tensor:
     """
-    Query ball point grouping.
+    Query ball point grouping (ONNX-compatible version).
 
     Args:
         radius: local region radius
@@ -107,16 +107,18 @@ def query_ball_point(
     sqrdists = square_distance(new_xyz, xyz)  # (B, S, N)
 
     # Find points within radius
+    # Use where instead of index assignment for ONNX compatibility
     group_idx = torch.arange(N, dtype=torch.long, device=device).view(1, 1, N).repeat(B, S, 1)
-    group_idx[sqrdists > radius ** 2] = N
+    mask_far = sqrdists > radius ** 2
+    group_idx = torch.where(mask_far, torch.tensor(N, dtype=torch.long, device=device), group_idx)
 
     # Take first nsample points
     group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
 
     # Handle cases where less than nsample points are found
     group_first = group_idx[:, :, 0].view(B, S, 1).repeat(1, 1, nsample)
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
+    mask_empty = group_idx == N
+    group_idx = torch.where(mask_empty, group_first, group_idx)
 
     return group_idx
 
