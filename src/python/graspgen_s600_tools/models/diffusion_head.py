@@ -127,11 +127,15 @@ class DiffusionHead(nn.Module):
             noise_pred: (B, sample_dim) predicted noise
         """
         device = observation_embedding.device
+        batch = observation_embedding.shape[0]
 
-        # Broadcast a scalar timestep to the batch (ONNX-friendly, static at export).
+        # Broadcast a scalar or length-1 timestep to the full batch
+        # (ONNX-friendly, static at export time).
         if torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(device)
-            timesteps = timesteps.expand(observation_embedding.shape[0])
+        timesteps = timesteps.to(device)
+        if timesteps.shape[0] != batch:
+            timesteps = timesteps.reshape(-1)[:1].expand(batch)
 
         timestep_embedding = self.diffusion_step_encoder(timesteps)
         sample_embedding = self.sample_encoder(sample)
