@@ -191,13 +191,18 @@ class PointNetSetAbstraction(nn.Module):
         self.group_all = group_all
         self.use_xyz = use_xyz
 
-        self.mlp_convs = nn.ModuleList()
-        self.mlp_bns = nn.ModuleList()
+        # Match upstream structure: self.mlps is a ModuleList with one Sequential
+        # The Sequential contains Conv2d + BN + ReLU for each MLP layer
+        layers = []
         last_channel = in_channel
         for out_channel in mlp:
-            self.mlp_convs.append(nn.Conv2d(last_channel, out_channel, 1))
-            self.mlp_bns.append(nn.BatchNorm2d(out_channel))
+            layers.append(nn.Conv2d(last_channel, out_channel, 1))
+            layers.append(nn.BatchNorm2d(out_channel))
+            layers.append(nn.ReLU(True))
             last_channel = out_channel
+
+        # Wrap in ModuleList to match upstream key structure
+        self.mlps = nn.ModuleList([nn.Sequential(*layers)])
 
     def forward(
         self,
@@ -237,10 +242,8 @@ class PointNetSetAbstraction(nn.Module):
             # new_points: (B, npoint, nsample, C+3)
             new_points = new_points.permute(0, 3, 2, 1)  # (B, C+3, nsample, npoint)
 
-        # Apply MLP
-        for i, conv in enumerate(self.mlp_convs):
-            bn = self.mlp_bns[i]
-            new_points = F.relu(bn(conv(new_points)))
+        # Apply MLP (using the Sequential in self.mlps[0])
+        new_points = self.mlps[0](new_points)
 
         # Max pooling over nsample (or N for group_all)
         new_points = torch.max(new_points, dim=2)[0]  # (B, mlp[-1], npoint/1)
@@ -315,17 +318,20 @@ class PointNetUpstream(nn.Module):
             nn.Linear(1024, self.output_embedding_dim),
         )
 
-    def forward(self, xyz: torch.Tensor, features: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, pc: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
 
         Args:
-            xyz: (B, N, 3) input point cloud
-            features: (B, C, N) optional input features (channel first)
+            pc: (B, N, 3) input point cloud (xyz only, no features)
 
         Returns:
             features: (B, output_embedding_dim) global features
         """
+        # Break up into xyz and features (upstream convention)
+        xyz = pc
+        features = None
+
         # SA layers
         for i in range(len(self.obj_SA_modules)):
             xyz, features = self.obj_SA_modules[i](xyz, features)
@@ -347,12 +353,12 @@ if __name__ == "__main__":
 
     batch_size = 2
     num_points = 2048
-    xyz = torch.randn(batch_size, num_points, 3)
+    pc = torch.randn(batch_size, num_points, 3)
 
     with torch.no_grad():
-        features = encoder(xyz)
+        features = encoder(pc)
 
-    print(f"✓ Input shape: {xyz.shape}")
+    print(f"✓ Input shape: {pc.shape}")
     print(f"✓ Output shape: {features.shape}")
     assert features.shape == (batch_size, 512), "Output shape mismatch!"
 

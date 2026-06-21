@@ -109,8 +109,8 @@ def main() -> int:
     test_pc = torch.randn(1, 2048, 3)
 
     with torch.no_grad():
-        upstream_out = upstream_encoder(test_pc, features=None)
-        our_out = our_encoder(test_pc, features=None)
+        upstream_out = upstream_encoder(test_pc)
+        our_out = our_encoder(test_pc)
 
     print(f"  Upstream output: {upstream_out.shape}  mean={upstream_out.mean():.6f}")
     print(f"  Our output:      {our_out.shape}  mean={our_out.mean():.6f}")
