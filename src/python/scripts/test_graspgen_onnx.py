@@ -27,7 +27,7 @@ from graspgen_s600_tools.models.graspgen_onnx import (
 
 NUM_POINTS = 2048
 NUM_GRASPS = 20
-SAMPLE_DIM = 9
+SAMPLE_DIM = 6
 THRESHOLD = 1e-3
 
 

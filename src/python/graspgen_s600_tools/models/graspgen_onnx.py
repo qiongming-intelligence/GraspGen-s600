@@ -4,8 +4,8 @@ ONNX-compatible GraspGen Generator and Discriminator.
 This module assembles the full S600-deployable GraspGen models from the
 ONNX-friendly building blocks implemented in this package:
 
-  - PointNetEncoder  (models/pointnet_encoder.py)   -- replaces PTV3 backbone
-  - DiffusionHead    (models/diffusion_head.py)      -- noise prediction net
+  - PointNetUpstream (models/pointnet_upstream.py)  -- weight-compatible PointNet++
+  - DiffusionHead    (models/diffusion_head.py)     -- noise prediction net
 
 Two deployable graphs are provided:
 
@@ -22,13 +22,15 @@ Two deployable graphs are provided:
 Design choices for ONNX/BPU compatibility:
   - Fixed batch size (B=1 object) and fixed num_grasps (K).
   - The point cloud is encoded once; object features are repeated per grasp.
-  - grasp_repr = "r3_6d" => sample_dim = 9 (matches configs/manifests).
+  - grasp_repr = "r3_so3" => sample_dim = 6 (matches upstream Robotiq).
 """
+
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from .pointnet_encoder import PointNetEncoder
+from .pointnet_upstream import PointNetUpstream
 from .diffusion_head import DiffusionHead
 
 
@@ -38,6 +40,36 @@ GRASP_REPR_DIM = {
     "r3_so3": 6,   # 3 translation + 3 axis-angle
     "r3_euler": 6,
 }
+
+
+def load_upstream_object_encoder_weights(
+    model: nn.Module,
+    checkpoint_path: str | Path,
+    strict: bool = True,
+) -> None:
+    """Load upstream Robotiq object_encoder weights into a model's PointNetUpstream.
+
+    The upstream checkpoints store the state dict under ``checkpoint['model']``
+    and object encoder parameters under the ``object_encoder.`` prefix.
+    Only the encoder is loaded here; diffusion/discriminator heads require
+    separate compatibility checks because their shape depends on grasp_repr and
+    attention mode.
+    """
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
+
+    prefix = "object_encoder."
+    encoder_state = {
+        key[len(prefix):]: value
+        for key, value in state_dict.items()
+        if key.startswith(prefix)
+    }
+    if not encoder_state:
+        raise ValueError(f"No {prefix!r} weights found in {checkpoint_path}")
+    if not hasattr(model, "object_encoder"):
+        raise AttributeError("model has no object_encoder attribute")
+
+    model.object_encoder.load_state_dict(encoder_state, strict=strict)
 
 
 class GraspGenGeneratorONNX(nn.Module):
@@ -51,16 +83,18 @@ class GraspGenGeneratorONNX(nn.Module):
     Args:
         num_obs_dim: object embedding dimension. Default: 512
         diffusion_embed_dim: timestep/sample embedding dim. Default: 512
-        grasp_repr: grasp representation. Default: "r3_6d" (sample_dim=9)
+        grasp_repr: grasp representation. Default: "r3_so3" (sample_dim=6)
         num_grasps: number of grasps generated per object (K). Default: 20
+        encoder_sampling: PointNetUpstream centroid sampling strategy. Default: "fps"
     """
 
     def __init__(
         self,
         num_obs_dim: int = 512,
         diffusion_embed_dim: int = 512,
-        grasp_repr: str = "r3_6d",
+        grasp_repr: str = "r3_so3",
         num_grasps: int = 20,
+        encoder_sampling: str = "fps",
     ):
         super().__init__()
         if grasp_repr not in GRASP_REPR_DIM:
@@ -71,8 +105,10 @@ class GraspGenGeneratorONNX(nn.Module):
         self.sample_dim = GRASP_REPR_DIM[grasp_repr]
         self.num_grasps = num_grasps
 
-        self.object_encoder = PointNetEncoder(
-            num_classes=num_obs_dim, normal_channel=False
+        self.object_encoder = PointNetUpstream(
+            output_embedding_dim=num_obs_dim,
+            feature_dim=-1,
+            sampling=encoder_sampling,
         )
         self.diffusion_head = DiffusionHead(
             diffusion_step_embed_dim=diffusion_embed_dim,
@@ -120,18 +156,20 @@ class GraspGenDiscriminatorONNX(nn.Module):
     Args:
         num_obs_dim: object embedding dimension. Default: 512
         sample_embed_dim: grasp embedding dimension. Default: 512
-        grasp_repr: grasp representation. Default: "r3_6d" (sample_dim=9)
+        grasp_repr: grasp representation. Default: "r3_so3" (sample_dim=6)
         num_grasps: number of candidate grasps (K). Default: 20
         apply_sigmoid: if True, output probabilities in [0, 1]. Default: True
+        encoder_sampling: PointNetUpstream centroid sampling strategy. Default: "fps"
     """
 
     def __init__(
         self,
         num_obs_dim: int = 512,
         sample_embed_dim: int = 512,
-        grasp_repr: str = "r3_6d",
+        grasp_repr: str = "r3_so3",
         num_grasps: int = 20,
         apply_sigmoid: bool = True,
+        encoder_sampling: str = "fps",
     ):
         super().__init__()
         if grasp_repr not in GRASP_REPR_DIM:
@@ -143,8 +181,10 @@ class GraspGenDiscriminatorONNX(nn.Module):
         self.num_grasps = num_grasps
         self.apply_sigmoid = apply_sigmoid
 
-        self.object_encoder = PointNetEncoder(
-            num_classes=num_obs_dim, normal_channel=False
+        self.object_encoder = PointNetUpstream(
+            output_embedding_dim=num_obs_dim,
+            feature_dim=-1,
+            sampling=encoder_sampling,
         )
 
         self.sample_encoder = nn.Sequential(
@@ -200,7 +240,7 @@ if __name__ == "__main__":
 
     num_points = 2048
     num_grasps = 20
-    sample_dim = 9
+    sample_dim = GRASP_REPR_DIM["r3_so3"]
 
     # Generator
     gen = GraspGenGeneratorONNX(num_grasps=num_grasps)

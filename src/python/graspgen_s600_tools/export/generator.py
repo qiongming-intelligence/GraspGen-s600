@@ -34,7 +34,7 @@ class GraspGenGeneratorONNXWrapper(nn.Module):
         generator: Original GraspGenGenerator model
         num_points: Fixed number of input points
         num_grasps: Fixed number of grasps to generate
-        output_dim: Grasp representation dimension (9 for r3_6d, 12 for r3_so3)
+        output_dim: Grasp representation dimension (9 for r3_6d, 6 for r3_so3)
     """
 
     def __init__(
@@ -42,7 +42,7 @@ class GraspGenGeneratorONNXWrapper(nn.Module):
         generator: nn.Module,
         num_points: int = 2048,
         num_grasps: int = 20,
-        output_dim: int = 9,
+        output_dim: int = 6,
     ):
         super().__init__()
         self.generator = generator
@@ -90,13 +90,12 @@ class GraspGenGeneratorONNXWrapper(nn.Module):
         # Shape: (B*K, num_obs_dim)
         object_feat_expanded = object_feat.repeat_interleave(self.num_grasps, dim=0)
 
-        # Predict noise using diffusion head
-        # The diffusion head takes noisy grasps, object features, and timestep
-        # and predicts the noise that should be removed
+        # Predict noise using diffusion head. Signature matches upstream:
+        # forward(observation_embedding, timesteps, sample)
         noise_pred = self.diffusion_head(
-            noisy_grasps,
             object_feat_expanded,
             timestep,
+            noisy_grasps,
         )
 
         return noise_pred
@@ -107,7 +106,7 @@ def export_generator_onnx(
     output_path: str,
     num_points: int = 2048,
     num_grasps: int = 20,
-    output_dim: int = 9,
+    output_dim: int = 6,
     opset_version: int = 17,
     verbose: bool = True,
 ) -> None:
@@ -226,8 +225,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="Config YAML path")
     parser.add_argument("--num-points", type=int, default=2048)
     parser.add_argument("--num-grasps", type=int, default=20)
-    parser.add_argument("--output-dim", type=int, default=9,
-                       help="9 for r3_6d, 12 for r3_so3")
+    parser.add_argument("--output-dim", type=int, default=6,
+                       help="9 for r3_6d, 6 for r3_so3")
 
     args = parser.parse_args()
 
