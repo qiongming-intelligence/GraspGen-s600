@@ -46,7 +46,7 @@ def square_distance(src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
 
 def random_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     """
-    Random sampling (ONNX-compatible replacement for FPS).
+    Random sampling (ONNX-compatible but non-deterministic).
 
     Args:
         xyz: (B, N, 3) input points
@@ -61,6 +61,94 @@ def random_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
     return indices
 
 
+def fps_faithful(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    Pure-PyTorch Farthest Point Sampling, 1:1 replicating the upstream CUDA kernel.
+
+    Faithfully reproduces all quirks of ``furthest_point_sampling_kernel`` in
+    ``pointnet2_ops/_ext-src/src/sampling_gpu.cu`` and ``sampling.cpp``:
+
+    1. Distance buffer initialised to **1e10**
+       (``sampling.cpp``: ``torch::full({..., 1e10})``).
+    2. First centroid is always **index 0**
+       (kernel: ``int old = 0; idxs[0] = old``).
+    3. Points with ``||p||² ≤ 1e-3`` are **never selected** as centroids
+       and their distance buffer entries are **never updated**
+       (kernel: ``if (mag <= 1e-3) continue`` before the distance update).
+    4. Update rule: ``temp[k] = min(temp[k], dist_to_new_centroid)``
+       (kernel: ``float d2 = min(d, temp[k]); temp[k] = d2``).
+    5. Tie-break: on equal distance, the **lowest global index** wins
+       (kernel per-thread: ``besti = d2 > best ? k : besti`` keeps lower k;
+       block reduction: ``dists_i[idx1] = v2 > v1 ? i2 : i1`` keeps lower tid).
+       ``torch.argmax`` returns the first (lowest-index) maximum → matches. ✓
+
+    Every operation inside the fixed-length loop (sub / mul / ReduceSum /
+    minimum / argmax / gather) is a standard ONNX opset-17 operator, so the
+    unrolled graph exports cleanly.
+
+    Args:
+        xyz: (B, N, 3) input point coordinates
+        npoint: number of centroids to sample
+
+    Returns:
+        indices: (B, npoint) sampled point indices
+    """
+    B, N, _ = xyz.shape
+    device = xyz.device
+
+    # 1. Initialise distance buffer to 1e10
+    dist = xyz.new_full((B, N), 1e10)
+
+    # 3. Near-origin mask: ‖p‖² ≤ 1e-3 → never selected, temp never updated
+    near_origin = (xyz ** 2).sum(dim=-1) <= 1e-3  # (B, N)
+
+    # 2. First centroid is always index 0
+    last = xyz.new_zeros(B, dtype=torch.long, device=device)
+
+    indices_list: list[torch.Tensor] = []
+    for _ in range(npoint):
+        indices_list.append(last)
+        # Gather the coordinates of the last-selected centroid: (B, 1, 3)
+        centroid = torch.gather(
+            xyz, 1, last.view(B, 1, 1).expand(-1, -1, 3)
+        )  # (B, 1, 3)
+        # Squared distance from every point to the centroid: (B, N)
+        d = ((xyz - centroid) ** 2).sum(dim=-1)
+        # 4. temp[k] = min(temp[k], d[k])
+        dist = torch.minimum(dist, d)
+        # 3. Near-origin points are never selected: set their candidate dist
+        #    to -1 so they can never win argmax (their real distances are kept
+        #    in <dist> for the next round, only the selection mask is affected).
+        masked = dist.masked_fill(near_origin, -1.0)
+        # 5. argmax → lowest-index tie (torch default)
+        last = masked.argmax(dim=-1)  # (B,)
+
+    return torch.stack(indices_list, dim=1)  # (B, npoint)
+
+
+def uniform_sample_pytorch(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
+    """
+    Deterministic uniform stride sampling (ONNX-compatible).
+
+    Picks every (N // npoint)-th point.  Less geometrically optimal than
+    FPS but fully deterministic and reproducible.
+
+    Args:
+        xyz: (B, N, 3) input points
+        npoint: number of points to sample
+
+    Returns:
+        indices: (B, npoint) indices of sampled points
+    """
+    B, N, _ = xyz.shape
+    device = xyz.device
+    stride = max(N // npoint, 1)
+    indices = torch.arange(0, npoint, dtype=torch.long, device=device) * stride
+    indices = indices.clamp(max=N - 1)
+    indices = indices.unsqueeze(0).expand(B, -1)  # (B, npoint)
+    return indices
+
+
 def query_ball_point(
     radius: float,
     nsample: int,
@@ -68,7 +156,23 @@ def query_ball_point(
     new_xyz: torch.Tensor
 ) -> torch.Tensor:
     """
-    Query ball point grouping (ONNX-compatible version).
+    Ball query grouping — pure-PyTorch, 1:1 replicating the upstream CUDA
+    ``ball_query`` kernel (pointnet2_ops/_ext-src/src/ball_query_gpu.cu).
+
+    The CUDA kernel semantics reproduced here:
+    - For each query center, scan all points in **original index order**.
+    - A point is included if its squared distance to the center < radius².
+    - Collect up to ``nsample`` points in index order.
+    - **Empty-slot fill**: if fewer than ``nsample`` points fall in the ball,
+      the remaining slots are filled with the **first in-ball point** index
+      (kernel: ``if (cnt == 0) for (l) idx[j*nsample+l] = k;``).
+
+    This implementation reproduces that exactly via sort + mask: out-of-radius
+    points are set to index ``N`` (a sentinel larger than any valid index),
+    sorting brings in-range points first in ascending index order, we take the
+    first ``nsample``, and any leftover sentinel slots are replaced by the
+    first valid index (the ``group_first`` fill). Uses only square_distance,
+    where, sort, slice — all ONNX opset-17 operators.
 
     Args:
         radius: local region radius
@@ -105,10 +209,10 @@ def sample_and_group(
     xyz: torch.Tensor,
     points: Optional[torch.Tensor] = None,
     use_xyz: bool = True,
-    use_random_sample: bool = True
+    sampling: str = "fps"
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Sample and group points (ONNX-compatible version).
+    Sample and group points.
 
     Args:
         npoint: number of centroids
@@ -117,7 +221,8 @@ def sample_and_group(
         xyz: (B, N, 3) input points
         points: (B, C, N) input features (channel first), optional
         use_xyz: concatenate xyz to features
-        use_random_sample: use random sampling instead of FPS
+        sampling: centroid selection strategy — "fps" (faithful CUDA replica),
+                  "random" (uniform random), or "uniform" (fixed stride)
 
     Returns:
         new_xyz: (B, npoint, 3) sampled centroids
@@ -125,11 +230,14 @@ def sample_and_group(
     """
     B, N, _ = xyz.shape
 
-    if use_random_sample:
+    if sampling == "fps":
+        fps_idx = fps_faithful(xyz, npoint)
+    elif sampling == "random":
         fps_idx = random_sample_pytorch(xyz, npoint)
+    elif sampling == "uniform":
+        fps_idx = uniform_sample_pytorch(xyz, npoint)
     else:
-        # FPS placeholder (not ONNX-compatible)
-        raise NotImplementedError("FPS not ONNX-compatible; use random sampling")
+        raise ValueError(f"Unknown sampling strategy: {sampling!r}")
 
     new_xyz = torch.gather(
         xyz, 1, fps_idx.unsqueeze(-1).expand(-1, -1, 3)
@@ -172,6 +280,7 @@ class PointNetSetAbstraction(nn.Module):
         mlp: list of output channel dimensions
         group_all: whether to group all points
         use_xyz: concatenate xyz to features
+        sampling: centroid selection strategy — "fps", "random", or "uniform"
     """
 
     def __init__(
@@ -182,7 +291,8 @@ class PointNetSetAbstraction(nn.Module):
         in_channel: int,
         mlp: list,
         group_all: bool = False,
-        use_xyz: bool = True
+        use_xyz: bool = True,
+        sampling: str = "fps"
     ):
         super().__init__()
         self.npoint = npoint
@@ -190,6 +300,7 @@ class PointNetSetAbstraction(nn.Module):
         self.nsample = nsample
         self.group_all = group_all
         self.use_xyz = use_xyz
+        self.sampling = sampling
 
         # Match upstream structure: self.mlps is a ModuleList with one Sequential
         # The Sequential contains Conv2d + BN + ReLU for each MLP layer
@@ -237,7 +348,8 @@ class PointNetSetAbstraction(nn.Module):
             new_points = new_points.permute(0, 3, 2, 1)  # (B, 3+C, N, 1)
         else:
             new_xyz, new_points = sample_and_group(
-                self.npoint, self.radius, self.nsample, xyz, points, self.use_xyz
+                self.npoint, self.radius, self.nsample, xyz, points, self.use_xyz,
+                sampling=self.sampling
             )
             # new_points: (B, npoint, nsample, C+3)
             new_points = new_points.permute(0, 3, 2, 1)  # (B, C+3, nsample, npoint)
@@ -260,6 +372,10 @@ class PointNetUpstream(nn.Module):
     Args:
         output_embedding_dim: output feature dimension (default: 512)
         feature_dim: input feature dim beyond xyz; -1 means xyz-only (default: -1)
+        sampling: centroid selection strategy for SA layers —
+                  "fps" (faithful CUDA-replica FPS, default),
+                  "random" (uniform random),
+                  "uniform" (fixed stride)
     """
 
     # Upstream OBJ_* constants
@@ -268,7 +384,12 @@ class PointNetUpstream(nn.Module):
     OBJ_NSAMPLES = [64, 128, None]
     OBJ_MLPS = [[0, 64, 128], [128, 128, 256], [256, 256, 512]]
 
-    def __init__(self, output_embedding_dim: int = 512, feature_dim: int = -1):
+    def __init__(
+        self,
+        output_embedding_dim: int = 512,
+        feature_dim: int = -1,
+        sampling: str = "fps"
+    ):
         super().__init__()
         self.output_embedding_dim = output_embedding_dim
 
@@ -306,6 +427,7 @@ class PointNetUpstream(nn.Module):
                     mlp=mlp[k][1:],  # skip the placeholder first elem
                     group_all=(self.OBJ_NPOINTS[k] is None),
                     use_xyz=True,
+                    sampling=sampling,
                 )
             )
 
