@@ -190,7 +190,8 @@ def query_ball_point(
     sqrdists = square_distance(new_xyz, xyz)  # (B, S, N)
 
     group_idx = torch.arange(N, dtype=torch.long, device=device).view(1, 1, N).repeat(B, S, 1)
-    mask_far = sqrdists > radius ** 2
+    # CUDA ball_query includes points only when d2 < radius2 (strictly inside).
+    mask_far = sqrdists >= radius ** 2
     group_idx = torch.where(mask_far, torch.tensor(N, dtype=torch.long, device=device), group_idx)
 
     group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
@@ -332,20 +333,26 @@ class PointNetSetAbstraction(nn.Module):
             new_points: (B, mlp[-1], npoint) or (B, mlp[-1], 1) output features
         """
         if self.group_all:
-            new_xyz = xyz.mean(dim=1, keepdim=True)  # (B, 1, 3)
+            # Match upstream GroupAll exactly:
+            # grouped_xyz = xyz.transpose(1, 2).unsqueeze(2) -> (B, 3, 1, N)
+            # grouped_features = features.unsqueeze(2)        -> (B, C, 1, N)
+            # new_features = cat([grouped_xyz, grouped_features], dim=1)
+            # The final max pool below reduces dim=-1 in upstream; our pooling
+            # reduces dim=2, so transpose to (B, C+3, N, 1).
+            new_xyz = torch.zeros_like(xyz[:, :1])
             B, N, _ = xyz.shape
 
+            grouped_xyz = xyz.transpose(1, 2).unsqueeze(2)  # (B, 3, 1, N)
             if points is not None:
-                points_transposed = points.transpose(1, 2)  # (B, N, C)
+                grouped_features = points.unsqueeze(2)  # (B, C, 1, N)
                 if self.use_xyz:
-                    combined = torch.cat([xyz, points_transposed], dim=-1)
+                    new_points = torch.cat([grouped_xyz, grouped_features], dim=1)
                 else:
-                    combined = points_transposed
+                    new_points = grouped_features
             else:
-                combined = xyz  # (B, N, 3)
+                new_points = grouped_xyz
 
-            new_points = combined.unsqueeze(1)  # (B, 1, N, 3+C)
-            new_points = new_points.permute(0, 3, 2, 1)  # (B, 3+C, N, 1)
+            new_points = new_points.transpose(2, 3)  # (B, 3+C, N, 1)
         else:
             new_xyz, new_points = sample_and_group(
                 self.npoint, self.radius, self.nsample, xyz, points, self.use_xyz,
