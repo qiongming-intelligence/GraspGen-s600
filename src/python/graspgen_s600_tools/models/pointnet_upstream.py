@@ -337,8 +337,6 @@ class PointNetSetAbstraction(nn.Module):
             # grouped_xyz = xyz.transpose(1, 2).unsqueeze(2) -> (B, 3, 1, N)
             # grouped_features = features.unsqueeze(2)        -> (B, C, 1, N)
             # new_features = cat([grouped_xyz, grouped_features], dim=1)
-            # The final max pool below reduces dim=-1 in upstream; our pooling
-            # reduces dim=2, so transpose to (B, C+3, N, 1).
             new_xyz = torch.zeros_like(xyz[:, :1])
             B, N, _ = xyz.shape
 
@@ -351,21 +349,19 @@ class PointNetSetAbstraction(nn.Module):
                     new_points = grouped_features
             else:
                 new_points = grouped_xyz
-
-            new_points = new_points.transpose(2, 3)  # (B, 3+C, N, 1)
         else:
             new_xyz, new_points = sample_and_group(
                 self.npoint, self.radius, self.nsample, xyz, points, self.use_xyz,
                 sampling=self.sampling
             )
-            # new_points: (B, npoint, nsample, C+3)
-            new_points = new_points.permute(0, 3, 2, 1)  # (B, C+3, nsample, npoint)
+            # Match upstream QueryAndGroup layout: (B, C+3, npoint, nsample)
+            new_points = new_points.permute(0, 3, 1, 2)
 
         # Apply MLP (using the Sequential in self.mlps[0])
         new_points = self.mlps[0](new_points)
 
-        # Max pooling over nsample (or N for group_all)
-        new_points = torch.max(new_points, dim=2)[0]  # (B, mlp[-1], npoint/1)
+        # Max pooling over nsample (or N for group_all), matching upstream dim=-1
+        new_points = torch.max(new_points, dim=-1)[0]  # (B, mlp[-1], npoint/1)
 
         return new_xyz, new_points
 
