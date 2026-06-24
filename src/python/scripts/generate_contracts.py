@@ -9,11 +9,11 @@ input/output shapes and compilation hints for Horizon S600.
 import sys
 from pathlib import Path
 
-# Add src/python to path
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root / "src" / "python"))
+# Import contract helpers directly to avoid loading the full export package.
+project_root = Path(__file__).parent.parent.parent.parent
+sys.path.insert(0, str(project_root / "src" / "python" / "graspgen_s600_tools" / "export"))
 
-from graspgen_s600_tools.export import (
+from contract import (  # noqa: E402
     generate_generator_contract,
     generate_discriminator_contract,
     save_contract,
@@ -35,7 +35,7 @@ def main():
         batch_size=1,
         num_points=2048,
         num_grasps=20,
-        grasp_repr="r3_6d",
+        grasp_repr="r3_so3",
         obs_backbone="pointnet",
         num_diffusion_steps=20,
     )
@@ -47,7 +47,7 @@ def main():
         batch_size=1,
         num_points=2048,
         num_candidates=20,
-        grasp_repr="r3_6d",
+        grasp_repr="r3_so3",
         obs_backbone="pointnet",
     )
     save_contract(disc_contract, contracts_dir / "graspgen_discriminator.json")

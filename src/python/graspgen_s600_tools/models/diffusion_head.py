@@ -13,28 +13,21 @@ It is backbone-agnostic: it only consumes the observation embedding vector, so
 it works identically with the original PTV3 encoder or our PointNet++ encoder.
 
 ONNX compatibility notes:
-- Uses only standard ops (Linear, ReLU, Mish, sin/cos, cat).
+- Uses only standard ops (Linear, ReLU, Mish, GELU, LayerNorm, sin/cos, cat).
 - The "cat" pose representation (concatenate embeddings + MLP) is fully static.
-- The optional transformer attention path from upstream is intentionally NOT
-  ported here; the pretrained Franka model uses `attention=cat_attn`, but for the
-  S600 deployment we target the static MLP head ("cat") which is BPU-friendly.
+- The upstream "cat_attn" path is supported. Because it attends over a single
+  query token, self-attention is exactly equivalent to the value projection plus
+  output projection, followed by the upstream residual LayerNorm.
 """
 
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SinusoidalPosEmb(nn.Module):
-    """
-    Sinusoidal positional embedding for diffusion timesteps.
-
-    Ported verbatim (numerically) from upstream grasp_gen.models.model_utils.
-    Fully ONNX-compatible (uses exp/sin/cos on a static arange).
-
-    Args:
-        dim: embedding dimension
-    """
+    """Sinusoidal positional embedding for diffusion timesteps."""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -55,34 +48,60 @@ class SinusoidalPosEmb(nn.Module):
         return emb
 
 
+class AttentionLayer(nn.Module):
+    """Single-token attention block matching upstream structure."""
+
+    def __init__(self, embed_dim: int, num_heads: int):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=False)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, query, key, value, query_pos_enc, key_pos_enc, attn_mask=None):
+        output, _ = self.attn(
+            query + query_pos_enc,
+            key + key_pos_enc,
+            value,
+            attn_mask=attn_mask,
+        )
+        return self.norm(query + output)
+
+
+class FFNLayer(nn.Module):
+    """Feed-forward residual block matching upstream structure."""
+
+    def __init__(self, embed_dim: int, hidden_dim: int, activation: str = "ReLU"):
+        super().__init__()
+        if activation == "ReLU":
+            act = nn.ReLU()
+        elif activation == "GELU":
+            act = nn.GELU()
+        else:
+            raise NotImplementedError(f"Unsupported activation: {activation}")
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            act,
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x):
+        return self.norm(x + self.ff(x))
+
+
 class DiffusionHead(nn.Module):
-    """
-    ONNX-compatible diffusion noise prediction network (MLP / "cat" variant).
-
-    Architecture (matches upstream DiffusionNoisePredictionNet with pose_repr="mlp"
-    and the non-attention "cat" path):
-
-        timestep --> SinusoidalPosEmb --> Linear --> Mish --> Linear  (step embed)
-        sample   --> Linear --> ReLU --> Linear                       (sample embed)
-        embed = cat([sample_embed, step_embed, obs_embed])
-        noise_pred = prediction_head(embed)
-
-    Args:
-        diffusion_step_embed_dim: dim of timestep embedding. Default: 512
-        observation_embed_dim: dim of object observation embedding. Default: 512
-        sample_embed_dim: dim of the sample embedding. Default: 512
-        sample_dim: dim of grasp representation (9 for r3_6d, 6 for r3_so3). Default: 9
-    """
+    """ONNX-compatible diffusion noise prediction network."""
 
     def __init__(
         self,
         diffusion_step_embed_dim: int = 512,
         observation_embed_dim: int = 512,
         sample_embed_dim: int = 512,
-        sample_dim: int = 9,
+        sample_dim: int = 6,
+        attention: str = "cat_attn",
     ):
         super().__init__()
         self.sample_dim = sample_dim
+        self.attention = attention
 
         self.diffusion_step_encoder = nn.Sequential(
             SinusoidalPosEmb(diffusion_step_embed_dim),
@@ -97,9 +116,24 @@ class DiffusionHead(nn.Module):
             nn.Linear(sample_embed_dim, sample_embed_dim),
         )
 
-        total_input_dim = (
-            sample_embed_dim + diffusion_step_embed_dim + observation_embed_dim
-        )
+        if self.attention == "cat_attn":
+            self.query_pos_enc = nn.Embedding(1, diffusion_step_embed_dim + observation_embed_dim + sample_embed_dim)
+            self.self_attention_layers = nn.ModuleList([
+                AttentionLayer(diffusion_step_embed_dim + observation_embed_dim + sample_embed_dim, 8)
+                for _ in range(3)
+            ])
+            self.ffn_layers = nn.ModuleList([
+                FFNLayer(diffusion_step_embed_dim + observation_embed_dim + sample_embed_dim, 512, "GELU")
+                for _ in range(3)
+            ])
+            total_input_dim = diffusion_step_embed_dim + observation_embed_dim + sample_embed_dim
+        elif self.attention == "cat":
+            self.query_pos_enc = None
+            self.self_attention_layers = None
+            self.ffn_layers = None
+            total_input_dim = sample_embed_dim + diffusion_step_embed_dim + observation_embed_dim
+        else:
+            raise NotImplementedError(f"Unsupported attention mode: {attention}")
 
         self.prediction_head = nn.Sequential(
             nn.Linear(total_input_dim, total_input_dim // 2),
@@ -109,60 +143,53 @@ class DiffusionHead(nn.Module):
             nn.Linear(total_input_dim // 4, sample_dim),
         )
 
-    def forward(
-        self,
-        observation_embedding: torch.Tensor,
-        timesteps: torch.Tensor,
-        sample: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Predict the noise in a noisy grasp sample.
-
-        Args:
-            observation_embedding: (B, observation_embed_dim) object features
-            timesteps: (B,) diffusion timesteps (float or long)
-            sample: (B, sample_dim) current noisy grasp
-
-        Returns:
-            noise_pred: (B, sample_dim) predicted noise
-        """
+    def _broadcast_timesteps(self, observation_embedding: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
         device = observation_embedding.device
         batch = observation_embedding.shape[0]
-
-        # Broadcast a scalar or length-1 timestep to the full batch
-        # (ONNX-friendly, static at export time).
         if torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(device)
         timesteps = timesteps.to(device)
         if timesteps.shape[0] != batch:
             timesteps = timesteps.reshape(-1)[:1].expand(batch)
+        return timesteps
 
+    def forward(self, observation_embedding: torch.Tensor, timesteps: torch.Tensor, sample: torch.Tensor) -> torch.Tensor:
+        timesteps = self._broadcast_timesteps(observation_embedding, timesteps)
         timestep_embedding = self.diffusion_step_encoder(timesteps)
         sample_embedding = self.sample_encoder(sample)
 
-        embed = torch.cat(
-            [sample_embedding, timestep_embedding, observation_embedding],
-            dim=-1,
-        )
+        if self.attention == "cat":
+            embed = torch.cat([sample_embedding, timestep_embedding, observation_embedding], dim=-1)
+            return self.prediction_head(embed)
 
+        embed = torch.cat([sample_embedding, timestep_embedding, observation_embedding], dim=-1).unsqueeze(0)
+        batch_size = embed.shape[1]
+        query_pos_enc = self.query_pos_enc.weight.repeat(1, batch_size, 1)
+        for i in range(3):
+            embed = self.self_attention_layers[i](
+                embed,
+                embed,
+                embed,
+                query_pos_enc,
+                query_pos_enc,
+            )
+            embed = self.ffn_layers[i](embed)
+        embed = embed.squeeze(0)
         return self.prediction_head(embed)
 
 
 if __name__ == "__main__":
     print("Testing DiffusionHead...")
 
-    B = 20  # batch = num_grasps for a single object
+    B = 20
     obs_dim = 512
-    sample_dim = 9
+    sample_dim = 6
 
-    head = DiffusionHead(
-        observation_embed_dim=obs_dim,
-        sample_dim=sample_dim,
-    )
+    head = DiffusionHead(observation_embed_dim=obs_dim, sample_dim=sample_dim, attention="cat_attn")
     head.eval()
 
     obs = torch.randn(B, obs_dim)
-    timestep = torch.tensor([5], dtype=torch.long)  # scalar-ish
+    timestep = torch.tensor([5], dtype=torch.long)
     sample = torch.randn(B, sample_dim)
 
     with torch.no_grad():

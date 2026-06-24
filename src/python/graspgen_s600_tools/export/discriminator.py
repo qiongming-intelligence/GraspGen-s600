@@ -28,7 +28,7 @@ class GraspGenDiscriminatorONNXWrapper(nn.Module):
         discriminator: Original GraspGenDiscriminator model
         num_points: Fixed number of input points
         num_candidates: Fixed number of grasp candidates to evaluate
-        grasp_dim: Grasp representation dimension (9 for r3_6d, 12 for r3_so3)
+        grasp_dim: Grasp representation dimension (9 for r3_6d, 6 for r3_so3)
     """
 
     def __init__(
@@ -36,7 +36,7 @@ class GraspGenDiscriminatorONNXWrapper(nn.Module):
         discriminator: nn.Module,
         num_points: int = 2048,
         num_candidates: int = 20,
-        grasp_dim: int = 9,
+        grasp_dim: int = 6,
     ):
         super().__init__()
         self.discriminator = discriminator
@@ -99,7 +99,7 @@ def export_discriminator_onnx(
     output_path: str,
     num_points: int = 2048,
     num_candidates: int = 20,
-    grasp_dim: int = 9,
+    grasp_dim: int = 6,
     opset_version: int = 17,
     verbose: bool = True,
 ) -> None:
@@ -176,8 +176,8 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str, help="Config YAML path")
     parser.add_argument("--num-points", type=int, default=2048)
     parser.add_argument("--num-candidates", type=int, default=20)
-    parser.add_argument("--grasp-dim", type=int, default=9,
-                       help="9 for r3_6d, 12 for r3_so3")
+    parser.add_argument("--grasp-dim", type=int, default=6,
+                       help="9 for r3_6d, 6 for r3_so3")
 
     args = parser.parse_args()
 

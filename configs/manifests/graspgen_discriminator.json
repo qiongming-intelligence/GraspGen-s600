@@ -24,7 +24,7 @@
       "concrete_shape": [
         1,
         20,
-        9
+        6
       ],
       "dtype": "float32"
     }
@@ -46,7 +46,7 @@
   ],
   "config": {
     "obs_backbone": "pointnet",
-    "grasp_repr": "r3_6d",
+    "grasp_repr": "r3_so3",
     "batch_size": 1
   },
   "metadata": {

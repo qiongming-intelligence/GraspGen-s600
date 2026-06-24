@@ -14,7 +14,7 @@ def generate_generator_contract(
     batch_size: int = 1,
     num_points: int = 2048,
     num_grasps: int = 20,
-    grasp_repr: Literal["r3_6d", "euler"] = "r3_6d",
+    grasp_repr: Literal["r3_6d", "r3_so3", "euler"] = "r3_so3",
     obs_backbone: Literal["pointnet", "pointnet2", "vit"] = "pointnet",
     num_diffusion_steps: int = 20,
 ) -> Dict:
@@ -25,7 +25,7 @@ def generate_generator_contract(
         batch_size: Batch size (fixed for BPU)
         num_points: Number of points in input point cloud
         num_grasps: Number of grasps to generate
-        grasp_repr: Grasp representation ("r3_6d" = position + 6D rotation, "euler" = position + euler angles)
+        grasp_repr: Grasp representation ("r3_6d" = position + 6D rotation, "r3_so3"/"euler" = position + 3D rotation)
         obs_backbone: Observation encoder backbone
         num_diffusion_steps: Number of diffusion denoising steps (reduced from 100 for speed)
 
@@ -47,14 +47,28 @@ def generate_generator_contract(
                 "concrete_shape": [batch_size, num_points, 3],
                 "dtype": "float32",
                 "range": [-1.0, 1.0],  # Expected after normalization
-            }
+            },
+            {
+                "name": "noisy_grasps",
+                "description": "Current noisy grasp samples",
+                "shape": ["B*K", "D"],
+                "concrete_shape": [batch_size * num_grasps, output_dim],
+                "dtype": "float32",
+            },
+            {
+                "name": "timestep",
+                "description": "Current diffusion timestep",
+                "shape": ["1"],
+                "concrete_shape": [1],
+                "dtype": "int64",
+            },
         ],
         "outputs": [
             {
-                "name": "grasps_pred",
-                "description": "Predicted grasp poses",
-                "shape": ["B", "K", "D"],
-                "concrete_shape": [batch_size, num_grasps, output_dim],
+                "name": "noise_pred",
+                "description": "Predicted noise for the denoising step",
+                "shape": ["B*K", "D"],
+                "concrete_shape": [batch_size * num_grasps, output_dim],
                 "dtype": "float32",
             }
         ],
@@ -81,7 +95,7 @@ def generate_discriminator_contract(
     batch_size: int = 1,
     num_points: int = 2048,
     num_candidates: int = 20,
-    grasp_repr: Literal["r3_6d", "euler"] = "r3_6d",
+    grasp_repr: Literal["r3_6d", "r3_so3", "euler"] = "r3_so3",
     obs_backbone: Literal["pointnet", "pointnet2"] = "pointnet",
 ) -> Dict:
     """

@@ -43,7 +43,9 @@ models/upstream/
 configs/calibration/data/*.npy
 configs/calibration/data/**/*.npy
 
-# Model files (too large for git)
+# Model files and generated compile artifacts (too large/noisy for git)
+models/hbm*/
+models/onnx*/
 *.onnx
 *.hbm
 *.bin

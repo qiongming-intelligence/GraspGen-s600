@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Phase 3 validation: export GraspGen Generator + Discriminator to ONNX,
-verify ONNXRuntime parity, and demonstrate the Python-side DDPM sampling loop.
+Phase 3 validation: load Robotiq weights, export GraspGen Generator + Discriminator
+to ONNX, verify ONNXRuntime parity, and demonstrate the Python-side DDPM sampling loop.
 
 The Generator graph is a single denoising step. The full reverse-diffusion
 process is orchestrated in Python (here), calling the ONNX graph once per
@@ -20,15 +20,19 @@ import torch
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "src" / "python"))
 
-from graspgen_s600_tools.models.graspgen_onnx import (
+from graspgen_s600_tools.models.graspgen_onnx import (  # noqa: E402
     GraspGenGeneratorONNX,
     GraspGenDiscriminatorONNX,
+    load_upstream_generator_weights,
+    load_upstream_discriminator_weights,
 )
 
 NUM_POINTS = 2048
 NUM_GRASPS = 20
 SAMPLE_DIM = 6
 THRESHOLD = 1e-3
+GEN_CKPT = PROJECT_ROOT / "models/upstream/graspgen_robotiq_2f_140_gen.pth"
+DIS_CKPT = PROJECT_ROOT / "models/upstream/graspgen_robotiq_2f_140_dis.pth"
 
 
 def _onnx_session(path):
@@ -37,13 +41,26 @@ def _onnx_session(path):
     return ort.InferenceSession(path, providers=["CPUExecutionProvider"])
 
 
+def _load_generator() -> GraspGenGeneratorONNX:
+    model = GraspGenGeneratorONNX(num_grasps=NUM_GRASPS, grasp_repr="r3_so3", attention="cat_attn")
+    load_upstream_generator_weights(model, GEN_CKPT, strict=True)
+    model.eval()
+    return model
+
+
+def _load_discriminator() -> GraspGenDiscriminatorONNX:
+    model = GraspGenDiscriminatorONNX(num_grasps=NUM_GRASPS, grasp_repr="r3_so3")
+    load_upstream_discriminator_weights(model, DIS_CKPT, strict=True)
+    model.eval()
+    return model
+
+
 def export_and_check_generator() -> bool:
     print("=" * 70)
-    print("Generator: export + precision check (single denoising step)")
+    print("Generator: Robotiq weights + export + precision check")
     print("=" * 70)
 
-    model = GraspGenGeneratorONNX(num_grasps=NUM_GRASPS)
-    model.eval()
+    model = _load_generator()
 
     pc = torch.randn(1, NUM_POINTS, 3)
     noisy = torch.randn(NUM_GRASPS, SAMPLE_DIM)
@@ -94,11 +111,10 @@ def export_and_check_generator() -> bool:
 
 def export_and_check_discriminator() -> bool:
     print("=" * 70)
-    print("Discriminator: export + precision check")
+    print("Discriminator: Robotiq weights + export + precision check")
     print("=" * 70)
 
-    model = GraspGenDiscriminatorONNX(num_grasps=NUM_GRASPS)
-    model.eval()
+    model = _load_discriminator()
 
     pc = torch.randn(1, NUM_POINTS, 3)
     grasps = torch.randn(1, NUM_GRASPS, SAMPLE_DIM)
@@ -151,8 +167,7 @@ def demo_ddpm_loop() -> bool:
         print(f"  ⚠️  diffusers not available ({e}); skipping loop demo.")
         return True
 
-    model = GraspGenGeneratorONNX(num_grasps=NUM_GRASPS)
-    model.eval()
+    model = _load_generator()
 
     num_iters = 20
     scheduler = DDPMScheduler(

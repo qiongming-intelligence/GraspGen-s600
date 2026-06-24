@@ -22,21 +22,43 @@
         -1.0,
         1.0
       ]
+    },
+    {
+      "name": "noisy_grasps",
+      "description": "Current noisy grasp samples",
+      "shape": [
+        "B*K",
+        "D"
+      ],
+      "concrete_shape": [
+        20,
+        6
+      ],
+      "dtype": "float32"
+    },
+    {
+      "name": "timestep",
+      "description": "Current diffusion timestep",
+      "shape": [
+        "1"
+      ],
+      "concrete_shape": [
+        1
+      ],
+      "dtype": "int64"
     }
   ],
   "outputs": [
     {
-      "name": "grasps_pred",
-      "description": "Predicted grasp poses",
+      "name": "noise_pred",
+      "description": "Predicted noise for the denoising step",
       "shape": [
-        "B",
-        "K",
+        "B*K",
         "D"
       ],
       "concrete_shape": [
-        1,
         20,
-        9
+        6
       ],
       "dtype": "float32"
     }
@@ -44,7 +66,7 @@
   "config": {
     "num_diffusion_iters_eval": 20,
     "obs_backbone": "pointnet",
-    "grasp_repr": "r3_6d",
+    "grasp_repr": "r3_so3",
     "batch_size": 1
   },
   "metadata": {

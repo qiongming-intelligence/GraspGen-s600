@@ -49,8 +49,8 @@ def main():
                        help="Number of input points")
     parser.add_argument("--num-grasps", type=int, default=20,
                        help="Number of grasps to generate/score")
-    parser.add_argument("--grasp-dim", type=int, default=9,
-                       help="Grasp representation dimension (9 for r3_6d, 12 for r3_so3)")
+    parser.add_argument("--grasp-dim", type=int, default=6,
+                       help="Grasp representation dimension (9 for r3_6d, 6 for r3_so3)")
 
     # Export options
     parser.add_argument("--opset-version", type=int, default=17,

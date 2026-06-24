@@ -42,34 +42,93 @@ GRASP_REPR_DIM = {
 }
 
 
+def _load_checkpoint_state_dict(checkpoint_path: str | Path) -> dict[str, torch.Tensor]:
+    """Load a PyTorch checkpoint and return its model state dict."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    return checkpoint["model"] if "model" in checkpoint else checkpoint
+
+
+def _load_prefixed_state_dict(
+    module: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    prefix: str,
+    checkpoint_path: str | Path,
+    strict: bool,
+) -> None:
+    """Load a prefixed subset of an upstream state dict into a module."""
+    module_state = {
+        key[len(prefix):]: value
+        for key, value in state_dict.items()
+        if key.startswith(prefix)
+    }
+    if not module_state:
+        raise ValueError(f"No {prefix!r} weights found in {checkpoint_path}")
+    module.load_state_dict(module_state, strict=strict)
+
+
 def load_upstream_object_encoder_weights(
     model: nn.Module,
     checkpoint_path: str | Path,
     strict: bool = True,
 ) -> None:
-    """Load upstream Robotiq object_encoder weights into a model's PointNetUpstream.
-
-    The upstream checkpoints store the state dict under ``checkpoint['model']``
-    and object encoder parameters under the ``object_encoder.`` prefix.
-    Only the encoder is loaded here; diffusion/discriminator heads require
-    separate compatibility checks because their shape depends on grasp_repr and
-    attention mode.
-    """
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["model"] if "model" in checkpoint else checkpoint
-
-    prefix = "object_encoder."
-    encoder_state = {
-        key[len(prefix):]: value
-        for key, value in state_dict.items()
-        if key.startswith(prefix)
-    }
-    if not encoder_state:
-        raise ValueError(f"No {prefix!r} weights found in {checkpoint_path}")
+    """Load upstream Robotiq object_encoder weights into a model's PointNetUpstream."""
+    state_dict = _load_checkpoint_state_dict(checkpoint_path)
     if not hasattr(model, "object_encoder"):
         raise AttributeError("model has no object_encoder attribute")
+    _load_prefixed_state_dict(
+        model.object_encoder,
+        state_dict,
+        "object_encoder.",
+        checkpoint_path,
+        strict,
+    )
 
-    model.object_encoder.load_state_dict(encoder_state, strict=strict)
+
+def load_upstream_generator_weights(
+    model: nn.Module,
+    checkpoint_path: str | Path,
+    strict: bool = True,
+) -> None:
+    """Load upstream PointNet GraspGen generator weights into the ONNX model."""
+    state_dict = _load_checkpoint_state_dict(checkpoint_path)
+    if not hasattr(model, "object_encoder"):
+        raise AttributeError("model has no object_encoder attribute")
+    if not hasattr(model, "diffusion_head"):
+        raise AttributeError("model has no diffusion_head attribute")
+
+    _load_prefixed_state_dict(
+        model.object_encoder,
+        state_dict,
+        "object_encoder.",
+        checkpoint_path,
+        strict,
+    )
+    _load_prefixed_state_dict(
+        model.diffusion_head,
+        state_dict,
+        "diffusion_head.",
+        checkpoint_path,
+        strict,
+    )
+
+
+def load_upstream_discriminator_weights(
+    model: nn.Module,
+    checkpoint_path: str | Path,
+    strict: bool = True,
+) -> None:
+    """Load upstream PointNet GraspGen discriminator weights into the ONNX model."""
+    state_dict = _load_checkpoint_state_dict(checkpoint_path)
+    for module_name in ("object_encoder", "sample_encoder", "prediction_head"):
+        if not hasattr(model, module_name):
+            raise AttributeError(f"model has no {module_name} attribute")
+        _load_prefixed_state_dict(
+            getattr(model, module_name),
+            state_dict,
+            f"{module_name}.",
+            checkpoint_path,
+            strict,
+        )
 
 
 class GraspGenGeneratorONNX(nn.Module):
@@ -95,6 +154,7 @@ class GraspGenGeneratorONNX(nn.Module):
         grasp_repr: str = "r3_so3",
         num_grasps: int = 20,
         encoder_sampling: str = "fps",
+        attention: str = "cat_attn",
     ):
         super().__init__()
         if grasp_repr not in GRASP_REPR_DIM:
@@ -115,6 +175,7 @@ class GraspGenGeneratorONNX(nn.Module):
             observation_embed_dim=num_obs_dim,
             sample_embed_dim=diffusion_embed_dim,
             sample_dim=self.sample_dim,
+            attention=attention,
         )
 
     def forward(
@@ -243,7 +304,7 @@ if __name__ == "__main__":
     sample_dim = GRASP_REPR_DIM["r3_so3"]
 
     # Generator
-    gen = GraspGenGeneratorONNX(num_grasps=num_grasps)
+    gen = GraspGenGeneratorONNX(num_grasps=num_grasps, attention="cat_attn")
     gen.eval()
     pc = torch.randn(1, num_points, 3)
     noisy = torch.randn(num_grasps, sample_dim)
