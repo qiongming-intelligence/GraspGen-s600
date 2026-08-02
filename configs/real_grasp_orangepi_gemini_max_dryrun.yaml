@@ -1,0 +1,233 @@
+# Orange Pi + Orbbec Gemini Max dry-run profile.
+#
+# This profile is intentionally non-moving:
+# - Orange Pi captures/provides metric point clouds from Gemini Max or files.
+# - S600 runs GraspGen inference and never authorizes motion.
+# - Yahboom/Dofbot arm integration is read-only health-check only.
+# - Real execution remains blocked by the adapter, unset calibration/workspace,
+#   collision requirements, and explicit CLI gates.
+
+network:
+  inference_host: "192.168.1.167"
+  bind_host: "0.0.0.0"
+  inference_port: 5556
+  timeout_ms: 300000
+
+pi:
+  user: "HwHiAiUser"
+  host: "192.168.1.104"
+  ssh_alias: "orangepi-graspgen"
+
+runtime:
+  backend: "monolithic_hbm"
+  hrt_model_exec: "/usr/hobot/bin/hrt_model_exec"
+  preload: "/home/sunrise/Projects/FoundationPose-s600/build/cmake/src/csrc/libfoundationpose_bpu_core1_preload.so"
+  hbm_root: "/home/sunrise/Projects/GraspGen-s600/models/hbm_split_gen_selected"
+  monolithic_hbm_dir: "/home/sunrise/Projects/GraspGen-s600/models/hbm"
+  work_dir: "/tmp/graspgen_s600_real_grasp"
+  keep_work_dir: false
+  num_points: 2048
+  num_grasps: 20
+  grasp_dim: 6
+  num_diffusion_steps: 20
+  seed: 0
+  topk: 5
+  monolithic:
+    generator: "graspgen_generator_pointnet.hbm"
+    discriminator: "graspgen_discriminator_pointnet.hbm"
+  split_generator:
+    sa1: "pointnet_sa1_neural_gen_bpu/pointnet_sa1_neural_gen_bpu.hbm"
+    sa2: "pointnet_sa2_neural_gen_conv1_cpu/pointnet_sa2_neural_gen_conv1_cpu.hbm"
+    sa3: "pointnet_sa3_encoder_head_gen_all_cpu/pointnet_sa3_encoder_head_gen_all_cpu.hbm"
+    head: "graspgen_generator_head_temb_simplified_pred_cpu/graspgen_generator_head_temb_simplified_pred_cpu.hbm"
+
+safety:
+  default_mode: "dry_run"
+  require_manual_approval: true
+  require_prior_dry_run_for_execute: true
+  require_collision_check_for_execute: true
+  require_workspace_bounds_for_execute: true
+  require_reachability_check_for_execute: true
+  max_request_age_s: 10.0
+  min_points_before_resample: 256
+  max_abs_coord_m: 5.0
+  workspace_bounds:
+    x: [null, null]
+    y: [null, null]
+    z: [null, null]
+  min_table_clearance_m: null
+  max_approach_distance_m: null
+  max_cartesian_speed_m_s: null
+  max_gripper_speed: null
+  table:
+    enabled: false
+    axis: "z"
+    height_m: null
+    min_clearance_m: 0.015
+  approach:
+    enabled: false
+    min_top_down_dot: 0.5
+  collision:
+    enabled: false
+    reject_radius_m: 0.01
+    max_points_in_radius: 0
+  reachability:
+    # Dry-run planning may proceed without reachability; execution remains blocked
+    # by require_reachability_check_for_execute until scripted bins or IK are set.
+    policy: "dry_run_only"
+
+calibration:
+  # Preferred direction for future calibration files: robot_base_T_camera.
+  robot_base_T_camera_path: null
+  # Legacy keys are ignored unless transform_direction is set explicitly.
+  transform_direction: null
+  world_T_camera_path: null
+  camera_T_robot_path: null
+  camera_frame: "gemini_max_depth"
+  robot_base_frame: null
+  observation_pose:
+    enabled: false
+    name: null
+    # No trusted fixed observation pose is configured yet. The previous Gemini
+    # Max pose that produced ~188k depth points is kept only as a probe-only
+    # named pose below; the operator observed that it was not aimed at the table.
+    # Promote a pose here only after pose-scout table/RGB evidence and calibration.
+    servo_positions_deg: {}
+    tolerance_deg:
+      default: 2.0
+    require_for_transform: true
+
+camera:
+  # The Gemini Max has been validated through OrbbecSDK v1 on Orange Pi. Until a
+  # first-class SDK adapter is committed, use a generated meter-unit NPY point
+  # cloud from the headless Gemini Max capture path for dry-run validation.
+  adapter: "file_point_cloud"
+  point_cloud_path: "/tmp/graspgen_depth_points_2048_m.npy"
+  scene_point_cloud_path: "/tmp/graspgen_depth_points_m.npy"
+  frame_id: "gemini_max_depth"
+  units: "meters"
+  segmentation:
+    enabled: true
+    method: "crop_table_cluster"
+    source: "scene_point_cloud"
+    # Conservative camera-frame crop from the validated Gemini Max view pose.
+    # This removes far background while keeping the near/mid workspace visible.
+    # Camera-frame crop for the current Dofbot-Pi5-style near table view.
+    # At this pose the Gemini Max sees the table plane at z~0.21-0.39 m, so the
+    # old far-view crop (z 0.5-2.0) would discard the entire workspace.
+    crop_bounds_m:
+      x: [-0.30, 0.30]
+      y: [-0.15, 0.18]
+      z: [0.18, 0.45]
+    table:
+      enabled: false
+      axis: "z"
+      object_side: "above"
+      estimate_percentile: 5.0
+      threshold_m: 0.008
+    cluster:
+      enabled: false
+      voxel_size_m: 0.015
+      min_points: 256
+    object_extent_min_m: [0.005, 0.005, 0.005]
+    object_extent_max_m: [2.0, 2.0, 2.0]
+    max_object_points: 4096
+  pose_scout:
+    # Pose scout ranks camera poses by actual table-facing depth/RGB evidence.
+    # It is not a calibration authority and never authorizes GraspGen execution.
+    candidate_poses: [depth_probe_points_only]
+    min_points: 20000
+    accept_score: 0.65
+    plane_distance_threshold_m: 0.012
+    ransac_iterations: 128
+    ransac_sample_points: 4096
+    ransac_evaluation_points: 50000
+    min_plane_fraction: 0.15
+    target_plane_fraction: 0.45
+    min_plane_extent_m: 0.12
+    target_plane_extent_m: 0.30
+    min_plane_normal_abs_z: 0.20
+    target_central_fraction: 0.25
+    preferred_depth_m: [0.30, 1.80]
+    central_bounds_m:
+      x: [-0.35, 0.35]
+      y: [-0.30, 0.30]
+    rgb:
+      require_color: false
+      min_colored_fraction: 0.02
+      target_colored_fraction: 0.08
+  orbbec:
+    sdk_root: "/home/HwHiAiUser/orbbec_sdk_v1/extracted/OrbbecSDK_v1.10.35"
+    capture_helper: "/tmp/graspgen_capture_depth_ply"
+    raw_point_cloud_path: "/tmp/graspgen_depth_points.ply"
+    full_point_cloud_path: "/tmp/graspgen_depth_points_m.npy"
+    sampled_point_cloud_path: "/tmp/graspgen_depth_points_2048_m.npy"
+    source_units: "millimeters"
+    output_units: "meters"
+    depth_width: 640
+    depth_height: 400
+
+robot:
+  adapter: "yahboom_arm_healthcheck"
+  arm_lib_path: "/home/HwHiAiUser/Arm_Lib"
+  # Do not assume the final bus. Use --robot-health-only with probe_i2c enabled
+  # after wiring/power is verified, then set bus_id to the detected bus.
+  bus_id: 7
+  addr: "0x15"
+  read_version: true
+  read_positions: true
+  probe_i2c: false
+  probe_buses: [1, 2, 3]
+  scripted_motion:
+    enabled: false
+    refuse_grasp_execution: true
+    servo_ids: [1, 2, 3, 4, 5, 6]
+    servo_ranges_deg:
+      1: [0.0, 180.0]
+      2: [0.0, 180.0]
+      3: [0.0, 180.0]
+      4: [0.0, 180.0]
+      5: [0.0, 270.0]
+      6: [0.0, 180.0]
+    max_delta_deg:
+      default: 1.0
+    max_delta_total_deg: 1.0
+    max_changed_servos: 1
+    default_duration_ms: 3000
+    min_duration_ms: 800
+    max_duration_ms: 5000
+    post_move_settle_s: 0.5
+    readback_tolerance_deg:
+      default: 2.0
+    write_strategy: "torque_enable_then_single_servo"
+    named_poses:
+      # Probe-only pose: it produced many depth points, but it has not been
+      # validated as table-facing and must not be used as observation_pose.
+      depth_probe_points_only:
+        servo_positions_deg:
+          1: 90.0
+          2: 95.0
+          3: 52.0
+          4: 62.0
+          5: 90.0
+          6: 90.0
+      # Dofbot-Pi5 official recognition / initial grasp-view pose from the
+      # non-ROS color-sorting course. For first camera-view checks, keep the
+      # gripper at 90 deg instead of the official 0 deg to avoid unnecessary
+      # gripper motion.
+      pi5_recognition_pose:
+        servo_positions_deg:
+          1: 90.0
+          2: 120.0
+          3: 0.0
+          4: 0.0
+          5: 90.0
+          6: 90.0
+      current:
+        servo_positions_deg:
+          1: 90.0
+          2: 95.0
+          3: 52.0
+          4: 62.0
+          5: 90.0
+          6: 90.0

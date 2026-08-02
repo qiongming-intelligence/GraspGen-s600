@@ -1,0 +1,681 @@
+# Opt-in scripted Yahboom/Dofbot motion profile for visual acquisition.
+#
+# This profile is intentionally separate from the non-moving dry-run profile.
+# It enables only explicitly gated named/delta servo scripts, not arbitrary
+# GraspGen grasp execution. Physical motion still requires --execute,
+# --i-understand-this-can-move-the-robot, and final typed MOVE approval.
+
+network:
+  inference_host: "192.168.1.167"
+  bind_host: "0.0.0.0"
+  inference_port: 5556
+  timeout_ms: 300000
+
+pi:
+  user: "HwHiAiUser"
+  host: "192.168.1.104"
+  ssh_alias: "orangepi-graspgen"
+
+runtime:
+  backend: "monolithic_hbm"
+  hrt_model_exec: "/usr/hobot/bin/hrt_model_exec"
+  preload: "/home/sunrise/Projects/FoundationPose-s600/build/cmake/src/csrc/libfoundationpose_bpu_core1_preload.so"
+  hbm_root: "/home/sunrise/Projects/GraspGen-s600/models/hbm_split_gen_selected"
+  monolithic_hbm_dir: "/home/sunrise/Projects/GraspGen-s600/models/hbm"
+  work_dir: "/tmp/graspgen_s600_real_grasp"
+  keep_work_dir: false
+  num_points: 2048
+  num_grasps: 20
+  grasp_dim: 6
+  num_diffusion_steps: 10
+  # The Robotiq generator was trained with TIMESTEPS=10
+  # (third_party/GraspGen/runs/train_graspgen_robotiq_2f_140_gen.sh:13), so the model
+  # has only ever seen timesteps 0-9. We previously assumed 100 and fed it t up to 95.
+  num_train_timesteps: 10
+  seed: 0
+  topk: 5
+  # The production generator HBM is compiled with a float32 timestep input and
+  # real max calibration. Feeding int64 would corrupt the timestep binding.
+  monolithic_timestep_dtype: "f32"
+  # Undoes the training-time translation scaling in the r3_so3 decode. Upstream
+  # multiplies grasp translations by kappa when building targets (matrix_to_rt)
+  # and divides on the way back (rt_to_matrix: mat[:, :3, 3] *= 1/kappa). Our
+  # exported ONNX returns the raw denoised vector and does NOT apply that inverse,
+  # so the runtime must.
+  #
+  # ADDED 2026-07-30. Omitting it inflated every translation offset by kappa:
+  # measured candidate offsets from the object centroid were 20.9-51.4mm where
+  # 6.4-15.7mm is correct, which threw grasp origins outside the object and made
+  # the workspace and collision gates reject all 20 candidates.
+  #
+  # Value is per-DATASET (kappa = 1 / mean(grasp_extent)), baked into the weights.
+  # Confirmed against the checkpoint's own upstream config, now vendored at
+  # configs/upstream_checkpoints/graspgen_robotiq_2f_140.yml (diffusion.kappa:
+  # 2.02217, obs_backbone: pointnet). franka_panda is 3.27 with obs_backbone ptv3.
+  # The export path reads that same YAML, so both sides now agree.
+  grasp_translation_kappa: 2.02217
+  monolithic:
+    generator: "graspgen_generator_pointnet.hbm"
+    discriminator: "graspgen_discriminator_pointnet.hbm"
+  split_generator:
+    sa1: "pointnet_sa1_neural_gen_bpu/pointnet_sa1_neural_gen_bpu.hbm"
+    sa2: "pointnet_sa2_neural_gen_conv1_cpu/pointnet_sa2_neural_gen_conv1_cpu.hbm"
+    sa3: "pointnet_sa3_encoder_head_gen_all_cpu/pointnet_sa3_encoder_head_gen_all_cpu.hbm"
+    head: "graspgen_generator_head_temb_simplified_pred_cpu/graspgen_generator_head_temb_simplified_pred_cpu.hbm"
+
+safety:
+  default_mode: "dry_run"
+  require_manual_approval: true
+  require_prior_dry_run_for_execute: true
+  require_collision_check_for_execute: true
+  require_workspace_bounds_for_execute: true
+  require_reachability_check_for_execute: true
+  max_request_age_s: 10.0
+  min_points_before_resample: 256
+  max_abs_coord_m: 5.0
+  # MEASURED, not guessed. Derived 2026-07-29 by numeric position IK over the
+  # calibrated FK chain; verify with:
+  #   python3 src/python/scripts/map_reachable_workspace.py --config <this file>
+  # which fails if any corner of this box is not IK-reachable.
+  #
+  # ENLARGED 2026-07-30. The previous box was x +-0.12, y 0.10..0.20, justified by
+  # a note claiming "at y=0.23 only |x|<=0.04 is reachable" and a forward limit of
+  # y=0.245. Both were re-measured against the CURRENT chain and are wrong now -
+  # they predate the tool_offset_xyz_m = [0,0,0.080] fingertip correction, which
+  # changed what IK is solving for.
+  #
+  # Re-measured with numeric position IK over a 15x13 grid at z=0.05, plus the
+  # `map_reachable_workspace.py` sweep, which independently reports
+  # forward_limit_y_m = 0.320 and lateral_limit_abs_x_m = 0.220:
+  #     y <= 0.22   every |x| <= 0.18 reachable
+  #     y = 0.26    |x| <= 0.18
+  #     y = 0.30    |x| <= 0.12
+  #     y = 0.32    |x| <= 0.09
+  #     y >= 0.34   nothing reachable
+  # The arc IS real, it just starts much further out than recorded.
+  #
+  # Box below is an inscribed rectangle with margin: all 18 probe points over
+  # x in {-0.15, 0, +0.15} x y in {0.12, 0.20, 0.28} x z in {0.015, 0.12} solve.
+  #
+  # WHY THIS MATTERS for grasping: the observation pose sees y = 0.157-0.397, so the
+  # old box overlapped the camera's view by only 45mm of depth (0.155..0.200) and
+  # rejected almost everything as outside_workspace. The new box overlaps by 125mm
+  # (0.155..0.280), nearly 3x. Objects still must be inside it, and y < 0.155 stays
+  # a camera blind zone regardless - that is a mounting limit, not a reach limit.
+  workspace_bounds:
+    x: [-0.15, 0.15]
+    y: [0.12, 0.28]
+    z: [0.010, 0.12]
+  # Camera-frame sanity bound on a candidate's translation. Set EXPLICITLY 2026-07-30.
+  #
+  # Without this key the gate falls back to `camera.segmentation.crop_bounds_m`,
+  # which is the wrong thing to reuse: that is a SEGMENTATION crop, sized to frame
+  # the scene and to cut sensor noise near the lens. A grasp point sits on an
+  # object's TOP surface, so it is legitimately NEARER the camera than the crop's
+  # near edge. Measured on the live scene: of 20 candidates for the main object, 13
+  # were rejected `outside_camera_workspace`, and the ones inspected failed only on
+  # z = 0.1752 < the crop's 0.18 near plane - i.e. rejected for being on top of the
+  # object, which is exactly where a top-down grasp belongs.
+  #
+  # This gate is not what keeps the robot safe; it overlaps three real gates that
+  # already do (`workspace_bounds` for reach, `table` for surface collision,
+  # `collision` for object collision). Its only job is to discard physically
+  # meaningless readings, so it is set to the depth sensor's trustworthy range:
+  # near limit 0.15 m is below the measured 0.185 m minimum depth (camera.depth
+  # .measured_min_depth_m) so real returns are never cut, and the lateral extent
+  # covers the full observed cloud (x -0.225..0.173, y -0.15..0.18 at this pose).
+  camera_workspace_bounds:
+    x: [-0.35, 0.35]
+    y: [-0.25, 0.25]
+    z: [0.15, 0.50]
+  min_table_clearance_m: null
+  max_approach_distance_m: null
+  max_cartesian_speed_m_s: null
+  max_gripper_speed: null
+  table:
+    # Height is the calibrated base-frame table plane: +4.3mm mean with 4.3mm
+    # spread across all 15 hand-eye samples (deploy/hand_eye_v2/
+    # base_frame_geometry_report.json). Clearance is kept at 15mm so a grasp
+    # cannot be planned into the table surface within calibration error.
+    enabled: true
+    axis: "z"
+    height_m: 0.0043
+    min_clearance_m: 0.015
+  approach:
+    # VERIFIED against real inference output 2026-07-29, not assumed. GraspGen's
+    # local +Z is the approach direction and points INTO the object, so on a table
+    # scene it points DOWN in the base frame: measured dot(+Z, base +Z) = -0.73
+    # mean over 20 candidates, negative for all 20. The gate therefore tests -Z.
+    # An earlier version tested +Z and rejected all 20 physically correct grasps.
+    # 0.5 admits up to 60 deg from vertical.
+    enabled: true
+    approach_axis: "z"
+    approach_axis_sign: -1.0
+    min_top_down_dot: 0.5
+  collision:
+    # mode CHANGED 2026-07-29 from origin_proximity to gripper_volume.
+    #
+    # Why the old test was wrong, not merely crude: it rejected if any scene point
+    # sat within 10mm of the grasp ORIGIN, but GraspGen's origin lies between the
+    # fingers, so on a correct grasp the object is supposed to be there. Measured
+    # on the first run with correct segmentation: the best candidates had scene
+    # points 1.9-5.8mm from the origin with up to 1087 points inside the radius,
+    # i.e. the gate rejected 13/20 physically sensible grasps. It only looked
+    # plausible while bad segmentation put every candidate on bare table.
+    #
+    # gripper_volume instead asks the right question: would the fingers or palm
+    # have to pass through geometry. Points BETWEEN the jaws are the target and do
+    # not count; points at or beyond the jaw walls, or behind the palm, do.
+    #
+    # Verified against upstream: config/grippers/robotiq_2f_140.yaml declares
+    # approach_direction [0,0,1] and contact points at local (+/-0.068, 0, 0.195),
+    # so local +Z is approach and the jaws close along local X. Our decode path is
+    # r3_so3, which regresses the pose directly and does NOT apply upstream's
+    # build_6d_grasp depth shift, so the origin is the gripper origin as predicted.
+    #
+    # DIMENSIONS UPDATED 2026-07-30 from a Dofbot URDF that includes the gripper.
+    # Upstream's Robotiq 2F-140 numbers (0.12 m aperture, 0.195 m depth) describe
+    # GraspGen's TRAINING gripper, not this hand, and must never be copied here.
+    #
+    # Provenance and its limits, because this matters for how far to trust them:
+    # the official Yahboom repo (YahboomTechnology/dofbot-jetson_nano) ships NO
+    # source at all - 439 PDFs, zero urdf/xacro/mesh/py files out of 759 entries.
+    # The official URDF (via j3soon/OmniIsaacGymEnvs-DofbotReacher
+    # thirdparty/dofbot_info) is byte-identical to our /home/sunrise/Projects/
+    # dofbot.urdf (md5 ad96a9f9c1d3ee03d30ce29262388ebf) and ALSO stops at link5,
+    # so the official model genuinely has no gripper; Gripping_point_Link lives
+    # only in their MoveIt package.
+    #
+    # Finger geometry below therefore comes from a THIRD-PARTY model,
+    # dondaha/Dofbot-Simulation-and-Control models/dofbot_urdf_with_gripper. Its
+    # ARM origins DIFFER from official (joint2 [0,-0.0183,0.0255] vs official
+    # [0,-0.00031873,0.04145]), so the arm chain is NOT interchangeable and was
+    # not taken. Only the finger sub-assembly relative to link5 is used, which is
+    # self-contained: a parallel four-bar with proximal joints 25.0mm apart at
+    # z=25.8mm from the flange and a 30.0mm finger segment splayed 38.5 deg,
+    # jaw limits +/-45 deg.
+    #
+    # CORRECTED 2026-07-30 using the finger STL meshes, not just joint origins.
+    # The earlier figures (62.1mm at 0 deg, 84.4mm at +45) measured the distance
+    # between the link6_*_2 JOINT ORIGINS and so ignored the finger bodies. The
+    # real graspable gap is between the inner FACES, from the mesh extents:
+    #     jaw -45 deg (closed)     -6.8 mm  (faces overlap: fully closed)
+    #     jaw   0 deg              37.4 mm
+    #     jaw +15 deg              48.3 mm
+    #     jaw +30 deg              55.9 mm
+    #     jaw +45 deg (URDF limit) 59.7 mm
+    # So the true maximum aperture is ~59.7mm, appreciably LESS than the 84.4mm
+    # previously assumed. Set to the +30 deg value: it is reachable well inside the
+    # URDF limit, and the servo-6 angle mapping is still undocumented in the
+    # Yahboom repo so the limit itself should not be relied on.
+    #
+    # Consequence worth knowing: the current test object is 64.5mm at its narrowest
+    # closing direction, which EXCEEDS the 59.7mm maximum. That object genuinely
+    # does not fit this hand - a narrower object is required for a real grasp.
+    enabled: true
+    mode: "gripper_volume"
+    finger_opening_m: 0.0559
+    # Finger segment length along the approach axis, from the link6_*_2 mesh z-span.
+    finger_length_m: 0.030
+    finger_thickness_m: 0.010
+    # Minimum scene points that must lie BETWEEN the jaws for a candidate to count
+    # as a real grasp. 0 disables the check.
+    #
+    # Added 2026-07-30 after finding that a candidate can pass every other gate
+    # while closing on air. The collision gate ignores material between the jaws on
+    # purpose (that material is the object), so nothing was checking the object was
+    # there at all. Measured: the selected candidate sat 51.0mm above the table with
+    # the object top face at 33.1mm, leaving the fingertips ~18mm clear; the count of
+    # scene points between the jaws was ZERO at every yaw and it still passed.
+    #
+    # 40 is deliberately modest: the cloud carries ~170k points over the near table,
+    # a 25mm cube face alone contributes several hundred, so 40 rejects air without
+    # demanding a dense view of a small object.
+    min_points_between_jaws: 40
+    palm_depth_m: 0.025
+    palm_half_width_m: 0.020
+    margin_m: 0.003
+    # Distance from the r3_so3 pose origin forward to the fingertip plane. Stays 0:
+    # this is a property of our decode path, not of the gripper, so the URDF says
+    # nothing about it. See the note in _gripper_volume_collision_ok.
+    origin_to_tip_m: 0.0
+    max_points_in_volume: 0
+  reachability:
+    # Numeric position-only IK against the calibrated chain. This is necessary but
+    # not sufficient for a full grasp: it verifies the tool origin is attainable,
+    # not that the wrist orientation is.
+    policy: "position_ik"
+    ik_tolerance_m: 0.005
+    ik_max_iterations: 200
+    ik_restarts: 6
+    # Block form, not inline: the Pi has no PyYAML and the subset parser in
+    # calibration.py/hbm_graspgen_runtime.py reads an inline map as a string.
+    seed_servo_positions_deg:
+      1: 90.245
+      2: 113.891
+      3: 0.164
+      4: 1.145
+      5: 90.271
+      6: 90.164
+
+calibration:
+  # Eye-in-hand ENABLED 2026-07-28: robot_base_T_camera is derived live from
+  # FK (with the calibrated joint-2 shoulder origin) composed with the solved
+  # gripper_T_camera. Solve: 16 yaw/pitch pairs, rotation residual
+  # 0.77/1.64 deg, translation 5.1/10.2 mm; base-frame table renders level
+  # (0.66 deg mean tilt) at +4mm height across all 15 samples. Valid at the
+  # verified observation pose with wrist roll near 90.27 deg; wrist-roll
+  # deviations beyond ~3 deg change the mount pose (compliance) and void it.
+  mode: "eye_in_hand"
+  robot_base_T_camera_path: null
+  gripper_T_camera_path: "deploy/hand_eye_v2/gripper_T_camera_fkfix.yaml"
+  gripper_frame: "dofbot_gripper"
+  transform_direction: null
+  world_T_camera_path: null
+  camera_T_robot_path: null
+  camera_frame: "gemini_max_depth"
+  robot_base_frame: "robot_base"
+  observation_pose:
+    enabled: true
+    name: "near_table_verified_2026_07_27"
+    # RESTORED AND VERIFIED ON HARDWARE 2026-07-27. Three consecutive captures
+    # from this pose gave 166904 / 169948 / 169916 points, every one of them
+    # inside the configured crop and inside the arm's 0.347 m reach, spanning
+    # 0.199-0.340 m with a 0.246 m median. check_camera_workspace_match.py
+    # passes with a 0.147 m workspace margin. Archived cloud:
+    # deploy/verified_captures/observation_pose_2026_07_27.ply
+    #
+    # History: the arm was moved to s3~52, s4~62 on 2026-07-10 and never moved
+    # back. From there the camera aims across the room, captures span 0.5-3.5 m,
+    # and the crop selects 0 points. Every hand-eye sample he01-he12 was taken
+    # from that wrong pose, which is why ICP only ever registered a distant
+    # plane and the AX=XB solve returned a physically impossible |t| = 0.77 m.
+    # Those samples are void; re-collect them from this pose.
+    #
+    # Values below are precise `dofbot_servo` readbacks (raw ticks converted in
+    # float), NOT `Arm_Lib` degrees. Arm_Lib would report 90/114/1/2/90/90 here,
+    # over-reading servos 2/3/4 by up to 0.9 deg. Use these for FK.
+    servo_positions_deg: {1: 90.245, 2: 113.891, 3: 0.164, 4: 1.145, 5: 90.271, 6: 90.164}
+    raw_ticks: {1: 2003, 2: 1708, 3: 3098, 4: 3086, 5: 1490, 6: 2002}
+    # Servo 2 carries the folded arm and settles ~1.1 deg below its target, so
+    # the command that reaches this pose is not the pose itself. Servo 3 sits 2
+    # ticks off the register maximum, i.e. against its mechanical stop.
+    command_to_reach_deg: {2: 115.091}
+    # Measured repeatability at this pose is 0.081 deg (one 0.0818 deg tick), so
+    # 2.0 deg is deliberately loose. It exists to catch gross drift like the
+    # ~50 deg move that broke 2026-07-10, not to police tick-level noise, and it
+    # leaves room for servo 2 to settle differently when the pose is re-entered
+    # from a distant configuration. Tighten only with fresh droop measurements.
+    tolerance_deg:
+      default: 2.0
+    require_for_transform: true
+  dynamic_table_markers:
+    # Camera-only dynamic marker calibration. This detects colored table dots in
+    # an aligned RGBD point cloud and can write robot_base_T_camera only after
+    # matching robot-base marker coordinates are supplied. It never moves the arm.
+    enabled: true
+    mode: "colored_point_cloud"
+    colored_point_cloud_path: "/tmp/graspgen_rgb_points.ply"
+    source_units: "millimeters"
+    min_marker_count: 3
+    prefer_marker_count: 5
+    max_mean_residual_m: 0.015
+    max_max_residual_m: 0.030
+    max_pairwise_distance_error_m: 0.015
+    duplicate_color_match_axis: "x"
+    duplicate_color_match_reverse: false
+    plane:
+      distance_threshold_m: 0.012
+      max_marker_plane_distance_m: 0.010
+      max_marker_plane_distance_p90_m: 0.018
+      ransac_iterations: 256
+      ransac_sample_points: 4096
+      ransac_evaluation_points: 50000
+    clustering:
+      mode: "combined_saturated"
+      cell_size_m: 0.004
+      min_points: 40
+      target_points: 600
+      max_extent_m: [0.070, 0.070, 0.060]
+    markers:
+      yellow_near:
+        color: "yellow"
+        # Current measured camera coordinate is only a matching hint for duplicate
+        # yellow dots; live RGBD detection still computes the camera point.
+        expected_camera_xyz_m: [-0.0272, -0.0789, 0.2144]
+        robot_base_xyz_m: [null, null, null]
+      yellow_left:
+        color: "yellow"
+        expected_camera_xyz_m: [-0.1232, -0.0231, 0.2604]
+        robot_base_xyz_m: [null, null, null]
+      red_right:
+        color: "red"
+        expected_camera_xyz_m: [0.1185, -0.0130, 0.2658]
+        robot_base_xyz_m: [null, null, null]
+  hand_eye:
+    # Calibration-only feature. Enabled here so offline hand-eye solving can run,
+    # but runtime planning still ignores it until calibration.mode is eye_in_hand
+    # and gripper_T_camera_path points at a validated YAML.
+    enabled: true
+    min_samples: 6
+    min_pairs: 8
+    min_pair_rotation_deg: 3.0
+    max_pair_translation_residual_m: 0.030
+    max_pair_rotation_residual_deg: 5.0
+    max_base_target_translation_spread_m: 0.030
+    max_base_target_rotation_spread_deg: 5.0
+    target:
+      frame: "calibration_target"
+      min_marker_count: 3
+      max_mean_residual_m: 0.010
+      max_max_residual_m: 0.020
+      markers:
+        yellow_near:
+          color: "yellow"
+          # Target frame is defined from the current three-dot RGBD geometry:
+          # yellow_near is origin, yellow_left lies on +X, red_right defines +Y.
+          target_xyz_m: [0.0, 0.0, 0.0]
+        yellow_left:
+          color: "yellow"
+          target_xyz_m: [0.1201900162, 0.0, 0.0]
+        red_right:
+          color: "red"
+          target_xyz_m: [-0.0661084860, 0.1544115542, 0.0]
+
+camera:
+  adapter: "file_point_cloud"
+  point_cloud_path: "/tmp/graspgen_depth_points_2048_m.npy"
+  scene_point_cloud_path: "/tmp/graspgen_depth_points_m.npy"
+  frame_id: "gemini_max_depth"
+  units: "meters"
+  # Device strings as reported over OrbbecSDK v1 on 2026-07-27. The SV1301S_U3
+  # name is the internal module designation; this is the Gemini Max unit.
+  device:
+    reported_name: "SV1301S_U3"
+    pid: "0x614"
+    serial: "AY21C5Y0010"
+    firmware: "RD3013"
+    # Measured, not from the datasheet: /tmp/graspgen_rgb_points.ply captured on
+    # 2026-07-09 reaches 0.185 m with a 0.273 m median. Near-range capability is
+    # confirmed good; there is no blind zone at this working distance.
+    measured_min_depth_m: 0.185
+    depth_intrinsics_640x400: {fx: 479.829, fy: 479.829, cx: 322.937, cy: 198.414}
+  segmentation:
+    enabled: true
+    method: "crop_table_cluster"
+    source: "scene_point_cloud"
+    # Near-table crop for the recognition-direction view. VERIFIED CORRECT: against
+    # /tmp/graspgen_rgb_points.ply (the 2026-07-09 good capture) this crop selects
+    # 169688 points and 94.4% of the cloud lies within the arm's reach.
+    #
+    # These bounds only work from the matching observation pose. From the arm pose
+    # used since 2026-07-10 the camera aims across the room instead of at the near
+    # table, the capture spans 0.5-3.5 m, and this crop selects 0 points. If that
+    # happens the pose is wrong, not the crop - see calibration.observation_pose.
+    # Verify with:
+    #   python3 src/python/scripts/check_camera_workspace_match.py \
+    #     --config <this file> --point-cloud <captured .ply>
+    crop_bounds_m:
+      x: [-0.30, 0.30]
+      y: [-0.15, 0.18]
+      z: [0.18, 0.45]
+    table:
+      # ENABLED 2026-07-29. Without this the "object" cloud handed to GraspGen was
+      # the whole cropped table (169046 points -> 2048), so the model saw a plane
+      # and placed grasps near the cloud centroid at base y~0.27 instead of on the
+      # object at y~0.17. That was the real cause of zero accepted candidates after
+      # the object was moved into reach.
+      #
+      # frame MUST be robot_base. The table normal is base +Z and no camera axis is
+      # parallel to it: camera z is depth, so the old camera-axis cut at the 5th
+      # percentile + 8mm kept 92.6% of the cloud, i.e. removed nothing useful.
+      # Measured with frame robot_base against the calibrated plane: 8mm keeps
+      # 23655/169046 points (14.0%), all genuinely off-plane.
+      enabled: true
+      frame: "robot_base"
+      base_axis: "z"
+      object_side: "above"
+      # Plane comes from safety.table.height_m (0.0043 m, calibrated) unless
+      # overridden here, so there is one table height in this file, not two.
+      threshold_m: 0.008
+    cluster:
+      # ENABLED 2026-07-29 with two deliberate choices:
+      #
+      # frame robot_base: voxel adjacency is frame-dependent, and reachability is
+      # only meaningful in the base frame.
+      #
+      # select most_points_in_workspace, NOT the largest cluster. This scene has a
+      # distant table edge at y~0.36 holding 5194 points and the actual object at
+      # y~0.186 holding 17170. Ranking by size alone is fragile here and a cluster
+      # the arm cannot reach is useless however big it is. Fails closed if no
+      # cluster has any point inside safety.workspace_bounds.
+      enabled: true
+      frame: "robot_base"
+      select: "most_points_in_workspace"
+      voxel_size_m: 0.015
+      min_points: 256
+    object_extent_min_m: [0.005, 0.005, 0.005]
+    object_extent_max_m: [2.0, 2.0, 2.0]
+    max_object_points: 4096
+  pose_scout:
+    # Pose scout ranks camera poses by actual table-facing depth/RGB evidence.
+    # It is not a calibration authority and never authorizes GraspGen execution.
+    candidate_poses: [depth_probe_points_only]
+    min_points: 20000
+    accept_score: 0.65
+    plane_distance_threshold_m: 0.012
+    ransac_iterations: 128
+    ransac_sample_points: 4096
+    ransac_evaluation_points: 50000
+    min_plane_fraction: 0.15
+    target_plane_fraction: 0.45
+    min_plane_extent_m: 0.12
+    target_plane_extent_m: 0.30
+    min_plane_normal_abs_z: 0.20
+    target_central_fraction: 0.25
+    preferred_depth_m: [0.30, 1.80]
+    central_bounds_m:
+      x: [-0.35, 0.35]
+      y: [-0.30, 0.30]
+    rgb:
+      require_color: false
+      min_colored_fraction: 0.02
+      target_colored_fraction: 0.08
+  orbbec:
+    sdk_root: "/home/HwHiAiUser/orbbec_sdk_v1/extracted/OrbbecSDK_v1.10.35"
+    capture_helper: "/tmp/graspgen_capture_depth_ply"
+    raw_point_cloud_path: "/tmp/graspgen_depth_points.ply"
+    full_point_cloud_path: "/tmp/graspgen_depth_points_m.npy"
+    sampled_point_cloud_path: "/tmp/graspgen_depth_points_2048_m.npy"
+    source_units: "millimeters"
+    output_units: "meters"
+    depth_width: 640
+    depth_height: 400
+
+robot:
+  adapter: "yahboom_arm_scripted_motion"
+  arm_lib_path: "/home/HwHiAiUser/Arm_Lib"
+  bus_id: 7
+  addr: "0x15"
+  read_version: true
+  read_positions: true
+  probe_i2c: false
+  probe_buses: [1, 2, 3]
+  kinematics:
+    # URDF-derived Dofbot serial chain from /home/sunrise/Projects/dofbot.urdf.
+    # Joint origins/RPY/axes now match the URDF. Arm_Lib raw servo zero/sign values
+    # are still provisional because the URDF does not encode controller mapping.
+    # Servo 6 is the gripper actuator and is intentionally excluded from pose FK.
+    enabled: true
+    model: "serial_chain"
+    base_frame: "robot_base"
+    tool_frame: "dofbot_gripper"
+    angle_units: "degrees"
+    joints:
+      1:
+        servo_id: 1
+        type: "revolute"
+        axis: [0.0, 0.0, 1.0]
+        origin_xyz_m: [0.0, 0.0, 0.06605]
+        origin_rpy_deg: [-0.6190808976, 0.0, 0.0]
+        raw_deg_at_zero: 90.0
+        sign: 1.0
+        limits_deg: [0.0, 180.0]
+      2:
+        servo_id: 2
+        type: "revolute"
+        axis: [0.0, 0.0, 1.0]
+        # Shoulder-mount origin CALIBRATED 2026-07-28 from 15 hand-eye samples:
+        # a pre-rotation rpy [18.03, 15.35, 179.59] deg (URDF shoulder bracket
+        # mirrored vs the real assembly) composed onto the URDF origin
+        # [0, -0.00031873, 0.04145] / rpy [0, 90.0002, 0]. Fitted by requiring
+        # the table plane to render level in the base frame across all
+        # configurations; table height then lands at +4mm with 4mm spread
+        # (independent check: the robot stands on this table). See
+        # deploy/hand_eye_v2/fk_decoupled_fit.json and
+        # src/python/scripts/calibrate_fk_pitch_zero_from_table.py.
+        origin_xyz_m: [-0.0103132795, 0.0132082058, 0.0379128429]
+        origin_rpy_deg: [131.5711528417, 66.485446904, -51.2929208728]
+        raw_deg_at_zero: 90.0
+        sign: -1.0
+        limits_deg: [0.0, 180.0]
+      3:
+        servo_id: 3
+        type: "revolute"
+        axis: [0.0, 0.0, 1.0]
+        origin_xyz_m: [-0.08285, 0.0, 0.0]
+        origin_rpy_deg: [0.0, 0.0, 0.0]
+        raw_deg_at_zero: 90.0
+        sign: 1.0
+        limits_deg: [0.0, 180.0]
+      4:
+        servo_id: 4
+        type: "revolute"
+        axis: [0.0, 0.0, 1.0]
+        origin_xyz_m: [-0.08285, 0.0, 0.0]
+        origin_rpy_deg: [0.0, 0.0, 0.4760190658]
+        raw_deg_at_zero: 90.0
+        sign: 1.0
+        limits_deg: [0.0, 180.0]
+      5:
+        servo_id: 5
+        type: "revolute"
+        axis: [0.0, 0.0, 1.0]
+        origin_xyz_m: [-0.07385, -0.001, 0.0]
+        origin_rpy_deg: [0.0, -89.9543738355, 0.0]
+        raw_deg_at_zero: 90.0
+        sign: 1.0
+        limits_deg: [0.0, 270.0]
+    # Flange (link5) -> FINGERTIP offset, SOLVED 2026-07-30 from gripper mesh
+    # geometry. This was previously [0,0,0], so FK reported the wrist flange and
+    # every planned pose was ~80mm short along the approach axis.
+    #
+    # Not solvable from camera data: adding L to FK and subtracting it from
+    # gripper_T_camera leaves every hand-eye observation identical, so it is a
+    # gauge freedom. Broken here with an EXTERNAL constraint - the gripper's own
+    # STL meshes.
+    #
+    # Chain: link6_left_joint_1 -> _joint_2 (parallel four-bar, counter-rotating
+    # about x) from the third-party gripper URDF, then the link6_*_2 mesh extent
+    # along +z. Official Yahboom ships no gripper model at all; the official arm
+    # URDF stops at link5. Fingertip distance from the link5 origin:
+    #     jaw +45 deg (widest open)  80.0 mm   <- approach configuration, used here
+    #     jaw   0 deg              100.1 mm
+    #     jaw -45 deg (closed)     106.4 mm
+    #
+    # Direction is tool +Z: at the verified observation pose tool +Z is
+    # [+0.264, +0.060, -0.963] in the base frame, i.e. pointing down at the table,
+    # matching the URDF's finger extent along link5 +z.
+    #
+    # INDEPENDENT CHECK: at the observation pose the flange sits at base
+    # z = +0.1051 and the calibrated table is at z = +0.004. The closed-jaw
+    # L = 106.4mm puts the tip at -1.4mm relative to the table - i.e. just
+    # touching. That is why the abandoned table-touch calibration measured only
+    # 17.5mm of available travel: the tip was already at the table.
+    tool_offset_xyz_m: [0.0, 0.0, 0.080]
+    tool_offset_rpy_deg: [0.0, 0.0, 0.0]
+  scripted_motion:
+    enabled: true
+    refuse_grasp_execution: true
+    servo_ids: [1, 2, 3, 4, 5, 6]
+    servo_ranges_deg:
+      1: [0.0, 180.0]
+      2: [0.0, 180.0]
+      3: [0.0, 180.0]
+      4: [0.0, 180.0]
+      5: [0.0, 270.0]
+      6: [0.0, 180.0]
+    max_delta_deg:
+      default: 1.0
+    max_delta_total_deg: 1.0
+    max_changed_servos: 1
+    default_duration_ms: 3000
+    min_duration_ms: 800
+    max_duration_ms: 5000
+    post_move_settle_s: 0.5
+    readback_tolerance_deg:
+      default: 2.0
+    # Verified on hardware: Arm_serial_servo_write6 and Arm_reset did not move
+    # reliably; torque enable + one Arm_serial_servo_write per changed servo did.
+    write_strategy: "torque_enable_then_single_servo"
+    named_poses:
+      # VERIFIED 2026-07-27 and promoted to calibration.observation_pose. Three
+      # consecutive captures here gave ~167-170k points, all inside the crop and
+      # inside the arm's reach, at 0.199-0.340 m. This is the only pose in this
+      # file confirmed by a passing check_camera_workspace_match.py run.
+      #
+      # These are command values, not readbacks. Servo 2 carries the folded arm
+      # and settles ~1.1 deg low, so commanding 115.091 lands at 113.891, which
+      # is the achieved pose recorded under calibration.observation_pose.
+      near_table_verified:
+        servo_positions_deg:
+          1: 90.245
+          2: 115.091
+          3: 0.164
+          4: 1.145
+          5: 90.271
+          6: 90.164
+      # Probe-only pose: it produced many depth points, but it has not been
+      # validated as table-facing and must not be used as observation_pose.
+      # Measured 2026-07-27 at s3=51.4/s4=62.1: depth spans 0.478-2.712 m and
+      # the crop selects 0 points. The camera aims across the room from here.
+      depth_probe_points_only:
+        servo_positions_deg:
+          1: 90.0
+          2: 95.0
+          3: 52.0
+          4: 62.0
+          5: 90.0
+          6: 90.0
+      # Dofbot-Pi5 official recognition / initial grasp-view pose from the
+      # non-ROS color-sorting course. For first camera-view checks, keep the
+      # gripper at 90 deg instead of the official 0 deg to avoid unnecessary
+      # gripper motion.
+      pi5_recognition_pose:
+        servo_positions_deg:
+          1: 90.0
+          2: 120.0
+          3: 0.0
+          4: 0.0
+          5: 90.0
+          6: 90.0
+      # Historical entry. It once reported ~176k points at z~0.21-0.39 m, but
+      # that was never reproduced and it was not re-tested on 2026-07-27. The
+      # nearby pose s3=51.4/s4=62.1 measured 0.478-2.712 m with an empty crop
+      # that day, so treat this pose as unverified. Use near_table_verified.
+      camera_table_view_pi5_partial:
+        servo_positions_deg:
+          1: 90.0
+          2: 98.0
+          3: 46.0
+          4: 55.0
+          5: 90.0
+          6: 90.0
+      current:
+        servo_positions_deg:
+          1: 90.0
+          2: 98.0
+          3: 46.0
+          4: 55.0
+          5: 90.0
+          6: 90.0

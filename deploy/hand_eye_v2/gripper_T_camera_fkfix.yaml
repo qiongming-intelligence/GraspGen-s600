@@ -1,0 +1,35 @@
+# REBASED 2026-07-30 for the fingertip tool offset.
+#
+# This solve was originally fitted with kinematics.tool_offset_xyz_m = [0,0,0],
+# so `dofbot_gripper` meant the wrist FLANGE. That offset is now [0, 0, 0.080]
+# (fingertip), so the target frame moved 80mm along tool +Z and this transform
+# must absorb exactly that or every camera observation shifts by 80mm.
+#
+# Compensation is `X_new = inv(F_tip) @ F_flange @ X_old`, which for a pure
+# translational tool offset reduces to subtracting it in the tool frame:
+# element [2][3] goes -0.09607037449 -> -0.17607037449 (-80mm exactly).
+# Rotation is UNCHANGED, and base_T_camera is preserved bit-for-bit, so the
+# hand-eye residuals below still describe this transform.
+gripper_T_camera:
+  - [0.9666311817, -0.1315290197, 0.2198278314, -0.02704888041]
+  - [-0.004831318968, 0.8486126801, 0.5289926063, 0.1848256199]
+  - [-0.2561265641, -0.5124028065, 0.8196600192, -0.17607037449]
+  - [0, 0, 0, 1]
+source_frame: "gemini_max_depth"
+target_frame: "dofbot_gripper"
+# Frame semantics after the 2026-07-30 rebase: the FINGERTIP plane, not the flange.
+target_frame_is_fingertip: true
+robot_base_frame: "robot_base"
+method: "eye_in_hand_markerless_point_cloud_ax_xb"
+sample_count: 11
+pair_count: 16
+mean_axxb_translation_residual_m: 0.005095185693452501
+max_axxb_translation_residual_m: 0.010210720132240295
+mean_axxb_rotation_residual_deg: 0.7725459893378308
+max_axxb_rotation_residual_deg: 1.6414527092291569
+rotation_system_singular_values: [0.32946328497170896, 0.2795588222811422, 0.17711120041184258, 0.031032711513667155]
+translation_system_rank: 3
+motion_authorized: false
+input_files:
+  config: "configs/real_grasp_orangepi_yahboom_scripted_motion.yaml"
+  samples: "deploy/hand_eye_v2/manifest_no_s5.json"
